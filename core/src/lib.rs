@@ -13,6 +13,7 @@ pub mod oauth;
 pub mod redact;
 pub mod report;
 pub mod scenario;
+pub mod streams;
 pub mod tls;
 pub mod types;
 pub mod ws;

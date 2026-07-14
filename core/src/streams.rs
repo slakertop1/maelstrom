@@ -1,0 +1,693 @@
+//! Request-chaining load engine ("streams").
+//!
+//! A run is a set of independent **streams** driven in parallel. Each stream is
+//! fired at its own target rate of ITERATIONS per second (open model); one
+//! iteration runs the stream's `steps` in order, threading values extracted from
+//! each response into `{{vars}}` used by later steps (per iteration — so virtual
+//! users never share a token/id). A single-request stream is just one step.
+//!
+//! Metrics come out three levels deep: overall → per stream (whole-chain
+//! success-rate + end-to-end latency) → per step (per-endpoint, so the funnel is
+//! visible as later steps see fewer requests than earlier ones).
+//!
+//! The existing `scenario` engine (parallel single-step targets) is untouched;
+//! this is an additive path. The per-request accumulator (`TargetAcc`) and
+//! finalization are reused from `scenario` so per-step stats never drift.
+
+use crate::dynval::DynState;
+use crate::multipart::{form_from_prepared, prepare_parts, PreparedPart};
+use crate::scenario::{LogFn, TargetAcc};
+use crate::types::*;
+use hdrhistogram::Histogram;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+pub type StreamsProgressFn = Arc<dyn Fn(&StreamsProgress) + Send + Sync>;
+
+/// One sample flowing to the aggregator: either a single step's outcome, or a
+/// whole-iteration (chain) outcome.
+enum Sample {
+    Step { stream: usize, step: usize, latency_us: u64, status: u16 },
+    Iter { stream: usize, ok: bool, e2e_us: u64 },
+}
+
+/// A step made ready to fire many times: client (with TLS), parsed method,
+/// prepared multipart, and flags for whether we must read the body/headers to
+/// satisfy this step's extract rules (so bodies are only materialized when used).
+struct PreparedStep {
+    client: reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+    multipart: Option<Arc<Vec<PreparedPart>>>,
+    extract: Vec<ExtractRule>,
+    needs_body: bool,
+    needs_headers: bool,
+}
+
+struct PreparedStream {
+    name: String,
+    rps: u32,
+    steps: Arc<Vec<PreparedStep>>,
+}
+
+/// Run a streams (request-chaining) load test to completion or until `cancel`.
+/// Validates and builds everything up front so a bad config fails fast.
+pub async fn run_streams(
+    mut spec: StreamScenarioSpec,
+    cancel: CancellationToken,
+    on_progress: StreamsProgressFn,
+    on_log: LogFn,
+) -> Result<StreamsResult, String> {
+    let log = |m: String| on_log(m);
+    let log_err = |m: String| {
+        on_log(format!("✗ {m}"));
+        m
+    };
+
+    spec.duration_secs = spec.duration_secs.clamp(1, 86_400);
+    spec.streams.retain(|s| s.rps > 0 && !s.steps.is_empty());
+    if spec.streams.is_empty() {
+        return Err(log_err("Не задано ни одного потока с RPS > 0 и шагами".to_string()));
+    }
+    if spec.streams.len() > 100 {
+        return Err(log_err("Слишком много потоков (максимум 100)".to_string()));
+    }
+
+    let timeout = Duration::from_millis(spec.timeout_ms.max(100));
+
+    // Build every stream's steps (validate methods/URLs, clients with TLS,
+    // prepare multipart) up front.
+    let mut prepared: Vec<PreparedStream> = Vec::with_capacity(spec.streams.len());
+    for s in &spec.streams {
+        let rps = s.rps.clamp(1, 100_000);
+        let mut steps = Vec::with_capacity(s.steps.len());
+        for st in &s.steps {
+            let method = reqwest::Method::from_bytes(st.method.as_bytes())
+                .map_err(|_| log_err(format!("Поток «{}»: неверный метод у шага «{}»", s.name, st.name)))?;
+            let url = st.url.trim().to_string();
+            // Literal URLs only — {{...}} is expanded per request.
+            if !url.contains("{{") && reqwest::Url::parse(&url).is_err() {
+                return Err(log_err(format!("Поток «{}»: неверный URL у шага «{}»", s.name, st.name)));
+            }
+            let headers: Vec<(String, String)> = st
+                .headers
+                .iter()
+                .filter(|(k, v)| {
+                    reqwest::header::HeaderName::from_bytes(k.trim().as_bytes()).is_ok()
+                        && reqwest::header::HeaderValue::from_str(v).is_ok()
+                })
+                .cloned()
+                .collect();
+            let mut builder = reqwest::Client::builder()
+                .timeout(timeout)
+                .pool_max_idle_per_host((rps as usize).clamp(8, 512))
+                .user_agent("Maelstrom-Streams/0.1");
+            builder = crate::tls::apply_tls(builder, &st.tls).map_err(&log_err)?;
+            let client = builder.build().map_err(|e| log_err(e.to_string()))?;
+
+            let multipart = match &st.multipart {
+                Some(parts) if parts.iter().any(|p| p.enabled && !p.name.trim().is_empty()) => Some(
+                    Arc::new(
+                        prepare_parts(parts)
+                            .map_err(|e| log_err(format!("Поток «{}»/«{}»: {e}", s.name, st.name)))?,
+                    ),
+                ),
+                _ => None,
+            };
+
+            let needs_headers = st.extract.iter().any(|e| e.from == "header");
+            let needs_body = st.extract.iter().any(|e| e.from != "header");
+
+            steps.push(PreparedStep {
+                client,
+                method,
+                url,
+                headers,
+                body: st.body.clone(),
+                multipart,
+                extract: st.extract.clone(),
+                needs_body,
+                needs_headers,
+            });
+        }
+        prepared.push(PreparedStream { name: s.name.clone(), rps, steps: Arc::new(steps) });
+    }
+
+    // Data providers (datasets + file pools) once, up front.
+    let dyn_state = Arc::new(
+        crate::dynval::resolve(&spec.datasets, &spec.file_pools)
+            .await
+            .map_err(&log_err)?,
+    );
+
+    log(format!(
+        "старт потоков: {} потоков на {}с",
+        prepared.len(),
+        spec.duration_secs
+    ));
+    for s in &prepared {
+        log(format!("  поток «{}»: {} шаг(ов) @ {} цепочек/с", s.name, s.steps.len(), s.rps));
+    }
+
+    let started_wall = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(spec.duration_secs);
+
+    let dropped: Vec<Arc<AtomicU64>> =
+        (0..prepared.len()).map(|_| Arc::new(AtomicU64::new(0))).collect();
+
+    let (tx, rx) = mpsc::unbounded_channel::<Sample>();
+    for (i, s) in prepared.iter().enumerate() {
+        tokio::spawn(stream_dispatcher(
+            i,
+            s.steps.clone(),
+            s.rps,
+            deadline,
+            cancel.clone(),
+            tx.clone(),
+            dyn_state.clone(),
+            dropped[i].clone(),
+        ));
+    }
+    drop(tx);
+
+    let names: Vec<String> = prepared.iter().map(|s| s.name.clone()).collect();
+    let step_meta: Vec<Vec<(String, String)>> = prepared
+        .iter()
+        .map(|s| s.steps.iter().map(|st| (st.url.clone(), st.method.to_string())).collect())
+        .collect();
+
+    let mut result =
+        aggregate(rx, &names, &step_meta, spec.duration_secs, started, &cancel, on_progress).await;
+    cancel.cancel();
+    result.started_at = started_wall;
+
+    let mut total_dropped = 0u64;
+    for (i, d) in dropped.iter().enumerate() {
+        let n = d.load(Ordering::Relaxed);
+        total_dropped += n;
+        if let Some(s) = result.streams.get_mut(i) {
+            s.dropped = n;
+        }
+    }
+    result.overall.dropped = total_dropped;
+    if total_dropped > 0 {
+        log(format!("⚠ недодано {total_dropped} итераций — целевой темп цепочек не достигнут"));
+    }
+    log(format!(
+        "потоки завершены: запросов={} ошибок={} ({:.2}%){}",
+        result.overall.total_requests,
+        result.overall.errors,
+        result.overall.error_rate,
+        if cancel.is_cancelled() { " (остановлено)" } else { "" }
+    ));
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_dispatcher(
+    stream_idx: usize,
+    steps: Arc<Vec<PreparedStep>>,
+    rps: u32,
+    deadline: tokio::time::Instant,
+    token: CancellationToken,
+    tx: mpsc::UnboundedSender<Sample>,
+    dyn_state: Arc<DynState>,
+    dropped: Arc<AtomicU64>,
+) {
+    let per_tick = rps as f64 / 20.0;
+    // Cap in-flight ITERATIONS at ~2s of arrivals so a slow chain doesn't grow
+    // memory without bound; excess arrivals are counted as dropped.
+    let cap = ((rps as usize) * 2).clamp(50, 20_000);
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let mut acc = 0.0_f64;
+    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = interval.tick() => {}
+        }
+        acc += per_tick;
+        let mut n = acc.floor() as usize;
+        acc -= n as f64;
+        while n > 0 {
+            if inflight.load(Ordering::Relaxed) >= cap {
+                dropped.fetch_add(n as u64, Ordering::Relaxed);
+                break;
+            }
+            inflight.fetch_add(1, Ordering::Relaxed);
+            let steps = steps.clone();
+            let tx = tx.clone();
+            let inflight = inflight.clone();
+            let dyn_state = dyn_state.clone();
+            tokio::spawn(async move {
+                run_iteration(stream_idx, &steps, &tx, &dyn_state).await;
+                inflight.fetch_sub(1, Ordering::Relaxed);
+            });
+            n -= 1;
+        }
+    }
+}
+
+/// Run one chain iteration: steps in order, threading extracted `{{vars}}`.
+/// Aborts remaining steps on the first failure (network error / status ≥ 400).
+async fn run_iteration(
+    stream_idx: usize,
+    steps: &[PreparedStep],
+    tx: &mpsc::UnboundedSender<Sample>,
+    dyn_state: &DynState,
+) {
+    let iter_start = Instant::now();
+    let mut vars: HashMap<String, String> = HashMap::new();
+    let mut ok = true;
+    for (i, step) in steps.iter().enumerate() {
+        let start = Instant::now();
+        let (status, body, headers) = send_step(step, &vars, dyn_state).await;
+        let latency_us = start.elapsed().as_micros().max(1) as u64;
+        let _ = tx.send(Sample::Step { stream: stream_idx, step: i, latency_us, status });
+        if status == 0 || status >= 400 {
+            ok = false;
+            break;
+        }
+        for rule in &step.extract {
+            if let Some(val) = extract_value(rule, body.as_deref(), &headers) {
+                vars.insert(rule.name.clone(), val);
+            }
+        }
+    }
+    let e2e_us = iter_start.elapsed().as_micros().max(1) as u64;
+    let _ = tx.send(Sample::Iter { stream: stream_idx, ok, e2e_us });
+}
+
+/// Build and send one step. Substitutes chain `{{vars}}` first, then the dynval
+/// generators (`{{$...}}`). Returns (status, body?, headers) — body/headers only
+/// read when this step has an extract rule that needs them.
+async fn send_step(
+    step: &PreparedStep,
+    vars: &HashMap<String, String>,
+    dyn_state: &DynState,
+) -> (u16, Option<String>, Vec<(String, String)>) {
+    // Build the request inside a block so the per-request context (which holds a
+    // !Sync RefCell) is dropped BEFORE the await below — keeps this future Send.
+    let req = {
+        let ctx = dyn_state.request();
+        let url = ctx.expand(&apply_vars(&step.url, vars));
+        let mut req = step.client.request(step.method.clone(), url);
+        for (k, v) in &step.headers {
+            if step.multipart.is_some() && k.trim().eq_ignore_ascii_case("content-type") {
+                continue;
+            }
+            req = req.header(k.trim(), ctx.expand(&apply_vars(v, vars)));
+        }
+        if let Some(parts) = &step.multipart {
+            req = req.multipart(form_from_prepared(parts, &ctx));
+        } else if let Some(b) = &step.body {
+            if !b.is_empty() {
+                req = req.body(ctx.expand(&apply_vars(b, vars)));
+            }
+        }
+        req
+    };
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let headers = if step.needs_headers {
+                resp.headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let body = if step.needs_body {
+                resp.text().await.ok()
+            } else {
+                let _ = resp.bytes().await; // drain and discard
+                None
+            };
+            (status, body, headers)
+        }
+        Err(_) => (0, None, Vec::new()),
+    }
+}
+
+/// Substitute `{{name}}` with a known chain variable. Unknown names and the
+/// dynval generators (`{{$...}}`, whose name starts with `$`) are left intact.
+fn apply_vars(s: &str, vars: &HashMap<String, String>) -> String {
+    if vars.is_empty() || !s.contains("{{") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find("{{") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 2..];
+        match after.find("}}") {
+            Some(end) => {
+                let inner = after[..end].trim();
+                match vars.get(inner) {
+                    Some(val) => out.push_str(val),
+                    None => {
+                        out.push_str("{{");
+                        out.push_str(&after[..end]);
+                        out.push_str("}}");
+                    }
+                }
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str("{{");
+                rest = after;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_value(
+    rule: &ExtractRule,
+    body: Option<&str>,
+    headers: &[(String, String)],
+) -> Option<String> {
+    match rule.from.as_str() {
+        "header" => headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(rule.expr.trim()))
+            .map(|(_, v)| v.clone()),
+        "regex" => {
+            let re = regex::Regex::new(&rule.expr).ok()?;
+            let caps = re.captures(body?)?;
+            caps.get(1).or_else(|| caps.get(0)).map(|m| m.as_str().to_string())
+        }
+        // default: JSON dot/bracket path (e.g. data.items.0.token)
+        _ => {
+            let v: serde_json::Value = serde_json::from_str(body?).ok()?;
+            json_path(&v, &rule.expr).map(json_scalar)
+        }
+    }
+}
+
+fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let norm = path.replace('[', ".").replace(']', "");
+    let mut cur = v;
+    for part in norm.split('.').filter(|p| !p.is_empty()) {
+        cur = match part.parse::<usize>() {
+            Ok(idx) => cur.get(idx)?,
+            Err(_) => cur.get(part)?,
+        };
+    }
+    Some(cur)
+}
+
+fn json_scalar(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Whole-chain accumulator: per-step request stats + iteration success + e2e.
+struct StreamAcc {
+    steps: Vec<TargetAcc>,
+    e2e: Histogram<u64>,
+    iters_started: u64,
+    iters_completed: u64,
+    e2e_sum_us: u128,
+    sec_iters: u64,
+}
+
+impl StreamAcc {
+    fn new(n_steps: usize) -> Self {
+        Self {
+            steps: (0..n_steps).map(|_| TargetAcc::new()).collect(),
+            e2e: Histogram::new(3).expect("hist"),
+            iters_started: 0,
+            iters_completed: 0,
+            e2e_sum_us: 0,
+            sec_iters: 0,
+        }
+    }
+    fn errors(&self) -> u64 {
+        self.steps.iter().map(|a| a.errors).sum()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn aggregate(
+    mut rx: mpsc::UnboundedReceiver<Sample>,
+    names: &[String],
+    step_meta: &[Vec<(String, String)>],
+    duration_secs: u64,
+    started: Instant,
+    token: &CancellationToken,
+    on_progress: StreamsProgressFn,
+) -> StreamsResult {
+    let mut accs: Vec<StreamAcc> = step_meta.iter().map(|s| StreamAcc::new(s.len())).collect();
+    let mut overall = TargetAcc::new();
+
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            sample = rx.recv() => match sample {
+                Some(Sample::Step { stream, step, latency_us, status }) => {
+                    if let Some(acc) = accs.get_mut(stream).and_then(|s| s.steps.get_mut(step)) {
+                        acc.record(latency_us, status);
+                    }
+                    overall.record(latency_us, status);
+                }
+                Some(Sample::Iter { stream, ok, e2e_us }) => {
+                    if let Some(s) = accs.get_mut(stream) {
+                        s.iters_started += 1;
+                        s.sec_iters += 1;
+                        if ok {
+                            s.iters_completed += 1;
+                        }
+                        let _ = s.e2e.record(e2e_us);
+                        s.e2e_sum_us += e2e_us as u128;
+                    }
+                }
+                None => break,
+            },
+            _ = ticker.tick() => {
+                let progress = StreamsProgress {
+                    elapsed_secs: started.elapsed().as_secs_f64(),
+                    overall_total: overall.total,
+                    overall_errors: overall.errors,
+                    overall_rps: overall.sec_requests as f64,
+                    overall_p95_ms: overall.hist.value_at_quantile(0.95) as f64 / 1000.0,
+                    streams: accs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| StreamProgress {
+                            name: names[i].clone(),
+                            iterations: s.iters_started,
+                            iters_per_sec: s.sec_iters as f64,
+                            errors: s.errors(),
+                        })
+                        .collect(),
+                };
+                for s in accs.iter_mut() {
+                    for a in s.steps.iter_mut() {
+                        a.tick();
+                    }
+                    s.sec_iters = 0;
+                }
+                overall.tick();
+                on_progress(&progress);
+            }
+        }
+    }
+
+    let actual_duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let stopped_early = token.is_cancelled();
+
+    let stream_results: Vec<StreamResult> = accs
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let started_n = s.iters_started;
+            let completed_n = s.iters_completed;
+            let e2e_sum = s.e2e_sum_us;
+            let e2e = &s.e2e;
+            let e2e_avg_ms = if started_n > 0 {
+                e2e_sum as f64 / started_n as f64 / 1000.0
+            } else {
+                0.0
+            };
+            let e2e_p50_ms = e2e.value_at_quantile(0.5) as f64 / 1000.0;
+            let e2e_p95_ms = e2e.value_at_quantile(0.95) as f64 / 1000.0;
+            let e2e_p99_ms = e2e.value_at_quantile(0.99) as f64 / 1000.0;
+            let steps: Vec<LoadTestResult> = s
+                .steps
+                .into_iter()
+                .enumerate()
+                .map(|(j, a)| {
+                    let (url, method) = step_meta[i][j].clone();
+                    a.finalize(
+                        RunMeta { target: url, kind: method, vus: 0, duration_secs, rps_limit: None },
+                        actual_duration_ms,
+                        stopped_early,
+                    )
+                })
+                .collect();
+            StreamResult {
+                name: names[i].clone(),
+                steps,
+                iterations_started: started_n,
+                iterations_completed: completed_n,
+                success_rate: if started_n > 0 {
+                    completed_n as f64 / started_n as f64 * 100.0
+                } else {
+                    0.0
+                },
+                e2e_avg_ms,
+                e2e_p50_ms,
+                e2e_p95_ms,
+                e2e_p99_ms,
+                dropped: 0, // filled by the caller from the dispatcher shortfall
+            }
+        })
+        .collect();
+
+    let overall_result = overall.finalize(
+        RunMeta {
+            target: format!("{} потоков", names.len()),
+            kind: "CHAIN".to_string(),
+            vus: 0,
+            duration_secs,
+            rps_limit: None,
+        },
+        actual_duration_ms,
+        stopped_early,
+    );
+
+    StreamsResult {
+        started_at: String::new(),
+        duration_secs,
+        actual_duration_ms,
+        overall: overall_result,
+        streams: stream_results,
+        stopped_early,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_vars_replaces_known_leaves_generators() {
+        let mut vars = HashMap::new();
+        vars.insert("token".to_string(), "abc123".to_string());
+        // known var replaced
+        assert_eq!(apply_vars("Bearer {{token}}", &vars), "Bearer abc123");
+        // generator ({{$...}}) and unknown name left intact for the next pass
+        assert_eq!(apply_vars("{{$uuid}}/{{missing}}/{{token}}", &vars), "{{$uuid}}/{{missing}}/abc123");
+        // whitespace tolerated
+        assert_eq!(apply_vars("{{ token }}", &vars), "abc123");
+        // no braces → unchanged
+        assert_eq!(apply_vars("plain", &vars), "plain");
+    }
+
+    #[test]
+    fn apply_vars_edge_cases() {
+        let mut vars = HashMap::new();
+        vars.insert("a".to_string(), "1".to_string());
+        vars.insert("b".to_string(), "2".to_string());
+        // adjacent placeholders
+        assert_eq!(apply_vars("{{a}}{{b}}", &vars), "12");
+        // dataset refs ({{$data...}}) untouched — expanded later by dynval
+        assert_eq!(apply_vars("{{$data.u.id}}-{{a}}", &vars), "{{$data.u.id}}-1");
+        // unclosed marker survives verbatim
+        assert_eq!(apply_vars("x {{a}} tail {{oops", &vars), "x 1 tail {{oops");
+        // empty vars → fast path, unchanged
+        assert_eq!(apply_vars("{{a}}", &HashMap::new()), "{{a}}");
+        // non-ASCII around placeholders preserved
+        assert_eq!(apply_vars("токен={{a}} мир", &vars), "токен=1 мир");
+    }
+
+    #[test]
+    fn json_path_navigates_objects_and_arrays() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"data":{"items":[{"token":"T1"},{"token":"T2"}]},"n":5}"#).unwrap();
+        assert_eq!(json_path(&v, "data.items.0.token").map(json_scalar), Some("T1".to_string()));
+        assert_eq!(json_path(&v, "data.items[1].token").map(json_scalar), Some("T2".to_string()));
+        assert_eq!(json_path(&v, "n").map(json_scalar), Some("5".to_string()));
+        assert!(json_path(&v, "data.missing").is_none());
+    }
+
+    #[test]
+    fn extract_value_by_source() {
+        let headers = vec![("X-Token".to_string(), "H1".to_string())];
+        let body = r#"{"id":42,"name":"bob"}"#;
+        // json
+        assert_eq!(
+            extract_value(&ExtractRule { name: "id".into(), from: "json".into(), expr: "id".into() }, Some(body), &[]),
+            Some("42".to_string())
+        );
+        // header (case-insensitive)
+        assert_eq!(
+            extract_value(&ExtractRule { name: "t".into(), from: "header".into(), expr: "x-token".into() }, None, &headers),
+            Some("H1".to_string())
+        );
+        // regex capture group 1
+        assert_eq!(
+            extract_value(&ExtractRule { name: "n".into(), from: "regex".into(), expr: r#""name":"(\w+)""#.into() }, Some(body), &[]),
+            Some("bob".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_value_edge_cases() {
+        let body = r#"{"data":{"deep":null},"n":7}"#;
+        let rule = |from: &str, expr: &str| ExtractRule { name: "x".into(), from: from.into(), expr: expr.into() };
+        // missing json path → None (var stays unset, later steps keep the literal)
+        assert_eq!(extract_value(&rule("json", "data.nope"), Some(body), &[]), None);
+        // null json value → empty string (set but empty)
+        assert_eq!(extract_value(&rule("json", "data.deep"), Some(body), &[]), Some(String::new()));
+        // body absent → None
+        assert_eq!(extract_value(&rule("json", "n"), None, &[]), None);
+        // body not JSON → None
+        assert_eq!(extract_value(&rule("json", "n"), Some("<html>"), &[]), None);
+        // invalid regex → None, never a panic
+        assert_eq!(extract_value(&rule("regex", "([unclosed"), Some(body), &[]), None);
+        // regex with no capture group falls back to the whole match
+        assert_eq!(extract_value(&rule("regex", r#"\d+"#), Some(body), &[]), Some("7".to_string()));
+        // header missing → None
+        assert_eq!(extract_value(&rule("header", "X-None"), None, &[]), None);
+    }
+
+    #[test]
+    fn json_path_edge_cases() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"arr":[10,20],"num":3.5,"flag":true,"nul":null}"#).unwrap();
+        // array index at root level
+        assert_eq!(json_path(&v, "arr.1").map(json_scalar), Some("20".to_string()));
+        assert_eq!(json_path(&v, "arr[0]").map(json_scalar), Some("10".to_string()));
+        // scalars stringify without quotes
+        assert_eq!(json_path(&v, "num").map(json_scalar), Some("3.5".to_string()));
+        assert_eq!(json_path(&v, "flag").map(json_scalar), Some("true".to_string()));
+        // null → empty string
+        assert_eq!(json_path(&v, "nul").map(json_scalar), Some(String::new()));
+        // out-of-range index → None
+        assert!(json_path(&v, "arr.5").is_none());
+    }
+}

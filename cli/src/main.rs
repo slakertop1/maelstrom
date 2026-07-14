@@ -7,7 +7,8 @@
 
 use maelstrom_core::report::build_scenario_report;
 use maelstrom_core::scenario::run_scenario;
-use maelstrom_core::types::ScenarioSpec;
+use maelstrom_core::streams::run_streams;
+use maelstrom_core::types::{ScenarioSpec, StreamScenarioSpec, StreamSpec};
 use clap::Parser;
 use serde::Deserialize;
 use std::io::Write;
@@ -45,6 +46,11 @@ struct Args {
     #[arg(long)]
     max_p95: Option<f64>,
 
+    /// Гейт (потоки/цепочки): минимальная доля завершённых цепочек в процентах —
+    /// проверяется для КАЖДОГО потока (иначе exit 1).
+    #[arg(long)]
+    min_success_rate: Option<f64>,
+
     /// Не печатать посекундный прогресс.
     #[arg(long)]
     quiet: bool,
@@ -74,6 +80,9 @@ struct CliConfig {
     duration_secs: u64,
     #[serde(default = "default_timeout")]
     timeout_ms: u64,
+    /// Independent HTTP targets (classic parallel scenario). Optional so a
+    /// streams-only config doesn't have to carry an empty array.
+    #[serde(default)]
     targets: Vec<maelstrom_core::types::ScenarioTarget>,
     #[serde(default)]
     datasets: Vec<maelstrom_core::types::DatasetSpec>,
@@ -87,6 +96,11 @@ struct CliConfig {
     /// When present, run a WebSocket load test instead of the HTTP scenario.
     #[serde(default)]
     websocket: Option<WsCliConfig>,
+    /// When present, run request-chaining streams: each stream fires its steps
+    /// in order at its own iterations-per-second rate, threading {{vars}}
+    /// extracted from responses. Single-step streams are plain load.
+    #[serde(default)]
+    streams: Vec<StreamSpec>,
 }
 
 #[derive(Deserialize)]
@@ -134,12 +148,21 @@ fn breached(value: f64, max: Option<f64>) -> bool {
     matches!(max, Some(m) if value > m)
 }
 
+/// Floor threshold (e.g. chain success-rate): breached when the value falls
+/// strictly BELOW the limit. `None` — not set, never fails.
+fn below(value: f64, min: Option<f64>) -> bool {
+    matches!(min, Some(m) if value < m)
+}
+
 #[derive(Deserialize, Default)]
 struct Thresholds {
     #[serde(default)]
     max_error_rate: Option<f64>,
     #[serde(default)]
     max_p95_ms: Option<f64>,
+    /// Streams only: minimum completed-chain rate (%), checked per stream.
+    #[serde(default)]
+    min_success_rate: Option<f64>,
 }
 
 /// Escape a value for a JSON string context: the config is JSON, and `${VAR}`
@@ -224,13 +247,16 @@ async fn main() -> ExitCode {
 
     let duration = args.duration.unwrap_or(cfg.duration_secs);
 
-    // gRPC / WebSocket load paths (separate transports) run and return before the
-    // HTTP scenario.
+    // gRPC / WebSocket / streams load paths run and return before the HTTP
+    // scenario.
     if let Some(g) = cfg.grpc.take() {
         return run_grpc_load(g, duration, &args, cfg.thresholds.as_ref(), &log_file).await;
     }
     if let Some(w) = cfg.websocket.take() {
         return run_ws_load(w, duration, &args, cfg.thresholds.as_ref(), &log_file).await;
+    }
+    if !cfg.streams.is_empty() {
+        return run_streams_load(cfg, duration, &args, &log_file).await;
     }
 
     // Resolve DB-backed datasets (SELECT → inline rows) before the run, so the
@@ -432,6 +458,222 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Run request-chaining streams (parallel chains + singles) and gate on
+/// thresholds: overall error rate / p95 + per-stream completed-chain rate.
+async fn run_streams_load(
+    cfg: CliConfig,
+    duration: u64,
+    args: &Args,
+    log_file: &Option<String>,
+) -> ExitCode {
+    let log = |cat: &str, msg: String| log_line(log_file, cat, &msg);
+
+    // Resolve DB-backed datasets to inline rows, as in the HTTP path.
+    let has_db = cfg.datasets.iter().any(|d| d.source.kind == "db");
+    if has_db {
+        log("CLI", "резолв БД-датасетов…".to_string());
+    }
+    let datasets = match maelstrom_db::resolve_db_datasets(
+        &cfg.datasets,
+        maelstrom_db::DB_DATASET_MAX_ROWS,
+    )
+    .await
+    {
+        Ok((d, warnings)) => {
+            for w in &warnings {
+                log("CLI", format!("⚠ {w}"));
+                eprintln!("⚠ {w}");
+            }
+            d
+        }
+        Err(e) => {
+            log("CLI", format!("Ошибка БД-датасета: {e}"));
+            return ExitCode::from(2);
+        }
+    };
+
+    let spec = StreamScenarioSpec {
+        duration_secs: duration,
+        timeout_ms: cfg.timeout_ms,
+        streams: cfg.streams,
+        datasets,
+        file_pools: cfg.file_pools,
+    };
+    let total_steps: usize = spec.streams.iter().map(|s| s.steps.len()).sum();
+    log(
+        "CLI",
+        format!(
+            "конфиг «{}»: {} потоков ({} шагов суммарно), {}с",
+            cfg.name.as_deref().unwrap_or("streams"),
+            spec.streams.len(),
+            total_steps,
+            duration
+        ),
+    );
+    println!(
+        "⚡ Maelstrom — потоки (цепочки): «{}», {} потоков / {} шагов, {} с",
+        cfg.name.as_deref().unwrap_or("streams"),
+        spec.streams.len(),
+        total_steps,
+        duration
+    );
+
+    let cancel = CancellationToken::new();
+    let cancel_sig = cancel.clone();
+    let lf = log_file.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        log_line(&lf, "CLI", "получен сигнал остановки (Ctrl-C)");
+        cancel_sig.cancel();
+    });
+
+    let quiet = args.quiet;
+    let log_prog = log_file.clone();
+    let on_progress = Arc::new(move |p: &maelstrom_core::types::StreamsProgress| {
+        let chains: String = p
+            .streams
+            .iter()
+            .map(|s| format!("{}={:.0}/с", truncate(&s.name, 14), s.iters_per_sec))
+            .collect::<Vec<_>>()
+            .join(" ");
+        log_line(
+            &log_prog,
+            "ПРОГРЕСС",
+            &format!(
+                "{:.0}с rps={:.0} всего={} ошибок={} p95={:.0}мс | цепочки: {chains}",
+                p.elapsed_secs, p.overall_rps, p.overall_total, p.overall_errors, p.overall_p95_ms
+            ),
+        );
+        if quiet {
+            return;
+        }
+        println!(
+            "[{:>4.0}с] rps={:>7} всего={:>9} ошибок={:>6} p95={:.0}мс",
+            p.elapsed_secs,
+            fmt(p.overall_rps),
+            fmt(p.overall_total as f64),
+            fmt(p.overall_errors as f64),
+            p.overall_p95_ms
+        );
+    });
+    let log_eng = log_file.clone();
+    let on_log = Arc::new(move |m: String| log_line(&log_eng, "ДВИЖОК", &m));
+
+    let result = match run_streams(spec, cancel, on_progress, on_log).await {
+        Ok(r) => r,
+        Err(e) => {
+            log("CLI", format!("Ошибка запуска: {e}"));
+            return ExitCode::from(2);
+        }
+    };
+
+    // JSON report.
+    if let Ok(json) = serde_json::to_string_pretty(&result) {
+        if let Err(e) = std::fs::write(&args.out_json, json) {
+            log("CLI", format!("Не удалось записать {}: {e}", args.out_json));
+        } else {
+            log("CLI", format!("JSON-отчёт записан: {}", args.out_json));
+            println!("JSON-отчёт: {}", args.out_json);
+        }
+    }
+    if args.out_html.is_some() {
+        // The three-level HTML report ships with the app-side report work.
+        log("CLI", "HTML-отчёт для потоков пока не поддерживается — записан JSON".to_string());
+        eprintln!("⚠ HTML-отчёт для потоков пока не поддерживается — записан JSON");
+    }
+
+    // Three-level summary: overall → per stream (chain) → per step (endpoint).
+    let o = &result.overall;
+    log(
+        "ИТОГ",
+        format!(
+            "{} запросов, {:.2}% ошибок, rps(средн.)={:.0}, p95={:.0}мс, p99={:.0}мс",
+            o.total_requests, o.error_rate, o.rps_avg, o.p95_ms, o.p99_ms
+        ),
+    );
+    println!(
+        "\nИтог: {} запросов, {:.2}% ошибок, RPS(средний)={:.0}, p95={:.0}мс, p99={:.0}мс",
+        o.total_requests, o.error_rate, o.rps_avg, o.p95_ms, o.p99_ms
+    );
+    println!("Потоки:");
+    for s in &result.streams {
+        let head = format!(
+            "«{}»: итераций={} завершено={} ({:.1}%), e2e p95={:.0}мс{}",
+            s.name,
+            s.iterations_started,
+            s.iterations_completed,
+            s.success_rate,
+            s.e2e_p95_ms,
+            if s.dropped > 0 { format!(", недодано={}", s.dropped) } else { String::new() }
+        );
+        log("ИТОГ", format!("  {head}"));
+        println!("  {head}");
+        for (j, st) in s.steps.iter().enumerate() {
+            let safe = maelstrom_core::redact::safe_url(&st.url);
+            let line = format!(
+                "{}. {:<7} {:<40} запросов={:<9} rps={:<7.0} ошибок={:.2}%  p95={:.0}мс",
+                j + 1,
+                st.method,
+                truncate(&safe, 40),
+                st.total_requests,
+                st.rps_avg,
+                st.error_rate,
+                st.p95_ms
+            );
+            log("ИТОГ", format!("    {line}"));
+            println!("    {line}");
+        }
+    }
+
+    // Thresholds → exit code.
+    let t = cfg.thresholds.as_ref();
+    let max_err = args.max_error_rate.or(t.and_then(|t| t.max_error_rate));
+    let max_p95 = args.max_p95.or(t.and_then(|t| t.max_p95_ms));
+    let min_sr = args.min_success_rate.or(t.and_then(|t| t.min_success_rate));
+    let mut failed = false;
+    if let Some(me) = max_err {
+        if breached(o.error_rate, Some(me)) {
+            log("ГЕЙТ", format!("✖ доля ошибок {:.2}% > {:.2}%", o.error_rate, me));
+            failed = true;
+        } else {
+            log("ГЕЙТ", format!("✓ доля ошибок {:.2}% ≤ {:.2}%", o.error_rate, me));
+        }
+    }
+    if let Some(mp) = max_p95 {
+        if breached(o.p95_ms, Some(mp)) {
+            log("ГЕЙТ", format!("✖ p95 {:.0}мс > {:.0}мс", o.p95_ms, mp));
+            failed = true;
+        } else {
+            log("ГЕЙТ", format!("✓ p95 {:.0}мс ≤ {:.0}мс", o.p95_ms, mp));
+        }
+    }
+    if let Some(ms) = min_sr {
+        for s in &result.streams {
+            if below(s.success_rate, Some(ms)) {
+                log(
+                    "ГЕЙТ",
+                    format!("✖ поток «{}»: завершено {:.1}% < {:.1}%", s.name, s.success_rate, ms),
+                );
+                failed = true;
+            } else {
+                log(
+                    "ГЕЙТ",
+                    format!("✓ поток «{}»: завершено {:.1}% ≥ {:.1}%", s.name, s.success_rate, ms),
+                );
+            }
+        }
+    }
+    if failed {
+        log("CLI", "завершение: код выхода 1 (порог превышен)".to_string());
+        return ExitCode::from(1);
+    }
+    if max_err.is_some() || max_p95.is_some() || min_sr.is_some() {
+        println!("✔ Все пороги пройдены");
+    }
+    log("CLI", "завершение: код выхода 0".to_string());
+    ExitCode::SUCCESS
+}
+
 /// Run a gRPC load test (unary/server-streaming) and gate on thresholds.
 async fn run_grpc_load(
     g: GrpcCliConfig,
@@ -591,7 +833,7 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{breached, expand_env};
+    use super::{below, breached, expand_env};
 
     #[test]
     fn threshold_gate() {
@@ -654,5 +896,61 @@ mod tests {
         assert_eq!(w.url, "ws://h");
         assert_eq!(w.vus, 10);
         assert!(w.message.is_empty());
+    }
+
+    #[test]
+    fn parses_streams_config_without_targets() {
+        // A streams-only config: no "targets" key at all (it defaults to []),
+        // extract rules threaded, thresholds carry min_success_rate.
+        let json = r#"{
+            "duration_secs": 60,
+            "streams": [{
+                "name": "checkout",
+                "rps": 100,
+                "steps": [
+                    {"name":"login","method":"POST","url":"http://x/login",
+                     "extract":[{"name":"token","from":"json","expr":"data.token"}]},
+                    {"name":"order","method":"POST","url":"http://x/order",
+                     "headers":[["Authorization","Bearer {{token}}"]]}
+                ]
+            }],
+            "thresholds": {"max_error_rate": 1.0, "min_success_rate": 99.0}
+        }"#;
+        let cfg: super::CliConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.targets.is_empty(), "targets defaults to empty");
+        assert_eq!(cfg.streams.len(), 1);
+        let s = &cfg.streams[0];
+        assert_eq!(s.rps, 100);
+        assert_eq!(s.steps.len(), 2);
+        assert_eq!(s.steps[0].extract.len(), 1);
+        assert_eq!(s.steps[0].extract[0].name, "token");
+        assert_eq!(s.steps[1].headers[0].1, "Bearer {{token}}");
+        let t = cfg.thresholds.unwrap();
+        assert_eq!(t.min_success_rate, Some(99.0));
+    }
+
+    #[test]
+    fn streams_take_precedence_over_targets_when_both_present() {
+        // Both blocks parse side by side; main() dispatches to the streams path
+        // whenever `streams` is non-empty (documented precedence).
+        let json = r#"{
+            "duration_secs": 10,
+            "targets": [{"name":"t","method":"GET","url":"http://x","rps":5}],
+            "streams": [{"name":"s","rps":10,"steps":[{"name":"a","method":"GET","url":"http://y"}]}]
+        }"#;
+        let cfg: super::CliConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.targets.len(), 1);
+        assert_eq!(cfg.streams.len(), 1);
+        assert!(!cfg.streams.is_empty(), "non-empty streams → streams path wins");
+    }
+
+    #[test]
+    fn success_rate_floor_gate() {
+        // not set -> never fails
+        assert!(!below(0.0, None));
+        // strictly below the floor breaches; exactly at the floor passes
+        assert!(below(98.9, Some(99.0)));
+        assert!(!below(99.0, Some(99.0)));
+        assert!(!below(100.0, Some(99.0)));
     }
 }

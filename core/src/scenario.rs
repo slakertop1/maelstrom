@@ -335,21 +335,24 @@ async fn send_once(
     }
 }
 
-struct TargetAcc {
-    hist: Histogram<u64>,
-    sec_hist: Histogram<u64>,
-    status_counts: HashMap<u16, u64>,
-    total: u64,
-    errors: u64,
-    sum_us: u128,
-    sec_requests: u64,
-    sec_errors: u64,
-    sec_sum_us: u128,
-    timeline: Vec<TimelinePoint>,
+/// Per-stream/per-target latency + error accumulator. `pub(crate)` so the
+/// streams engine reuses the exact same record/tick/finalize logic instead of
+/// duplicating it.
+pub(crate) struct TargetAcc {
+    pub(crate) hist: Histogram<u64>,
+    pub(crate) sec_hist: Histogram<u64>,
+    pub(crate) status_counts: HashMap<u16, u64>,
+    pub(crate) total: u64,
+    pub(crate) errors: u64,
+    pub(crate) sum_us: u128,
+    pub(crate) sec_requests: u64,
+    pub(crate) sec_errors: u64,
+    pub(crate) sec_sum_us: u128,
+    pub(crate) timeline: Vec<TimelinePoint>,
 }
 
 impl TargetAcc {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             hist: Histogram::new(3).expect("hist"),
             sec_hist: Histogram::new(3).expect("hist"),
@@ -364,7 +367,7 @@ impl TargetAcc {
         }
     }
 
-    fn record(&mut self, latency_us: u64, status: u16) {
+    pub(crate) fn record(&mut self, latency_us: u64, status: u16) {
         self.total += 1;
         self.sum_us += latency_us as u128;
         self.sec_requests += 1;
@@ -378,7 +381,7 @@ impl TargetAcc {
         }
     }
 
-    fn tick(&mut self) {
+    pub(crate) fn tick(&mut self) {
         self.timeline.push(TimelinePoint {
             sec: self.timeline.len() as u64 + 1,
             requests: self.sec_requests,
@@ -396,6 +399,22 @@ impl TargetAcc {
         self.sec_errors = 0;
         self.sec_sum_us = 0;
         self.sec_hist.reset();
+    }
+
+    /// Consume the accumulator into a `LoadTestResult`. Shared with the streams
+    /// engine so per-step/per-target finalization never drifts.
+    pub(crate) fn finalize(self, meta: RunMeta, actual_duration_ms: f64, stopped: bool) -> LoadTestResult {
+        finalize_result(
+            &self.hist,
+            self.status_counts,
+            self.total,
+            self.errors,
+            self.sum_us,
+            self.timeline,
+            meta,
+            actual_duration_ms,
+            stopped,
+        )
     }
 }
 
@@ -461,13 +480,7 @@ async fn aggregate(
         .into_iter()
         .enumerate()
         .map(|(i, a)| {
-            finalize_result(
-                &a.hist,
-                a.status_counts,
-                a.total,
-                a.errors,
-                a.sum_us,
-                a.timeline,
+            a.finalize(
                 RunMeta {
                     target: targets[i].url.clone(),
                     kind: targets[i].method.clone(),
@@ -481,13 +494,7 @@ async fn aggregate(
         })
         .collect();
 
-    let overall_result = finalize_result(
-        &overall.hist,
-        overall.status_counts,
-        overall.total,
-        overall.errors,
-        overall.sum_us,
-        overall.timeline,
+    let overall_result = overall.finalize(
         RunMeta {
             target: format!("{} ручек", targets.len()),
             kind: "MIX".to_string(),

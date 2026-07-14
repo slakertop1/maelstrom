@@ -248,3 +248,103 @@ pub struct ScenarioResult {
     pub targets: Vec<LoadTestResult>,
     pub stopped_early: bool,
 }
+
+// ---------- request chaining (streams) ----------
+
+/// Pull a value from a step's response into a named variable, usable as
+/// `{{name}}` in later steps of the SAME chain iteration (per virtual user).
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ExtractRule {
+    pub name: String,
+    /// "json" — dot/bracket path (e.g. `data.items.0.token`)
+    /// "header" — response header name
+    /// "regex" — first capture group of the pattern applied to the body
+    pub from: String,
+    pub expr: String,
+}
+
+/// One step of a chain: a request plus what to extract from its response.
+/// A single-request stream is just one step with no `extract`.
+#[derive(Deserialize, Serialize, Clone)]
+pub struct StreamStep {
+    pub name: String,
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    #[serde(default)]
+    pub multipart: Option<Vec<MultipartPart>>,
+    #[serde(default)]
+    pub extract: Vec<ExtractRule>,
+}
+
+/// A load stream fired at `rps` ITERATIONS per second (open model): each
+/// iteration runs `steps` in order, threading extracted `{{vars}}`. Streams run
+/// in parallel; a chain that hits an error (network / status ≥ 400) aborts its
+/// remaining steps and counts as a failed iteration.
+#[derive(Deserialize, Serialize, Clone)]
+pub struct StreamSpec {
+    pub name: String,
+    pub rps: u32,
+    pub steps: Vec<StreamStep>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct StreamScenarioSpec {
+    pub duration_secs: u64,
+    pub timeout_ms: u64,
+    pub streams: Vec<StreamSpec>,
+    #[serde(default)]
+    pub datasets: Vec<DatasetSpec>,
+    #[serde(default)]
+    pub file_pools: Vec<FilePoolSpec>,
+}
+
+/// Per-stream result: per-step (per-endpoint) metrics + whole-chain metrics.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StreamResult {
+    pub name: String,
+    /// One entry per step, in order — funnel is visible as later steps see
+    /// fewer requests than earlier ones.
+    pub steps: Vec<LoadTestResult>,
+    pub iterations_started: u64,
+    pub iterations_completed: u64, // ran every step without error
+    pub success_rate: f64,         // completed / started * 100
+    pub e2e_avg_ms: f64,           // whole-chain latency (first step → last step)
+    pub e2e_p50_ms: f64,
+    pub e2e_p95_ms: f64,
+    pub e2e_p99_ms: f64,
+    pub dropped: u64, // iterations the scheduler couldn't start (target too slow)
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StreamsResult {
+    pub started_at: String,
+    pub duration_secs: u64,
+    pub actual_duration_ms: f64,
+    pub overall: LoadTestResult, // every request across all streams/steps
+    pub streams: Vec<StreamResult>,
+    pub stopped_early: bool,
+}
+
+#[derive(Serialize, Clone)]
+pub struct StreamProgress {
+    pub name: String,
+    pub iterations: u64,
+    pub iters_per_sec: f64,
+    pub errors: u64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct StreamsProgress {
+    pub elapsed_secs: f64,
+    pub overall_total: u64,
+    pub overall_errors: u64,
+    pub overall_rps: f64,
+    pub overall_p95_ms: f64,
+    pub streams: Vec<StreamProgress>,
+}
