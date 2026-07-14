@@ -1,0 +1,23 @@
+# Rust / Cargo — any target dir at any depth (root and src-tauri/)
+target/
+
+# Node / frontend
+node_modules
+dist
+
+# Build & task logs
+*.log
+
+# Generated load-test reports
+reports/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test TLS material — regenerate with testdata/certs/generate.sh (never commit private keys)
+testdata/certs/*
+!testdata/certs/generate.sh
+
+# Портативная сборка (бинарник, не в репозиторий)
+portable/

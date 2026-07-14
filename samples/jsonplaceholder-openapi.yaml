@@ -1,0 +1,155 @@
+openapi: 3.0.3
+info:
+  title: JSONPlaceholder API
+  version: "1.0.0"
+  description: >
+    Реальный публичный тестовый API (https://jsonplaceholder.typicode.com).
+    Все ручки живые — можно импортировать, отправлять запросы и запускать
+    нагрузку по нескольким ручкам сразу. Авторизация не нужна, CORS открыт.
+servers:
+  - url: https://jsonplaceholder.typicode.com
+components:
+  schemas:
+    Post:
+      type: object
+      required: [title, body, userId]
+      properties:
+        id: { type: integer, example: 1 }
+        userId: { type: integer, example: 1 }
+        title: { type: string, example: "Новый пост" }
+        body: { type: string, example: "Текст поста" }
+    Comment:
+      type: object
+      properties:
+        id: { type: integer }
+        postId: { type: integer }
+        name: { type: string }
+        email: { type: string, format: email }
+        body: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        username: { type: string }
+        email: { type: string, format: email }
+paths:
+  /posts:
+    get:
+      operationId: listPosts
+      summary: Список постов
+      parameters:
+        - name: userId
+          in: query
+          required: false
+          schema: { type: integer }
+          example: 1
+    post:
+      operationId: createPost
+      summary: Создать пост
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Post" }
+  /posts/{id}:
+    get:
+      operationId: getPost
+      summary: Пост по id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+          example: 1
+    put:
+      operationId: replacePost
+      summary: Заменить пост
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+          example: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Post" }
+    patch:
+      operationId: updatePost
+      summary: Обновить пост
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+          example: 1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, example: "Изменённый заголовок" }
+    delete:
+      operationId: deletePost
+      summary: Удалить пост
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+          example: 1
+  /posts/{id}/comments:
+    get:
+      operationId: getPostComments
+      summary: Комментарии к посту
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+          example: 1
+  /comments:
+    get:
+      operationId: listComments
+      summary: Список комментариев
+      parameters:
+        - name: postId
+          in: query
+          required: false
+          schema: { type: integer }
+          example: 1
+  /users:
+    get:
+      operationId: listUsers
+      summary: Список пользователей
+  /users/{id}:
+    get:
+      operationId: getUser
+      summary: Пользователь по id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+          example: 1
+  /todos:
+    get:
+      operationId: listTodos
+      summary: Список задач
+      parameters:
+        - name: userId
+          in: query
+          required: false
+          schema: { type: integer }
+          example: 1
+        - name: completed
+          in: query
+          required: false
+          schema: { type: boolean }
+  /albums:
+    get:
+      operationId: listAlbums
+      summary: Список альбомов

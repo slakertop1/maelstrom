@@ -1,0 +1,20 @@
+# Example GitLab CI job: run the load test from a runner inside the network and
+# fail the pipeline if a threshold is breached. The HTML report is kept as an
+# artifact. Secrets come from CI/CD variables (masked), never the repo.
+loadtest:
+  image: ghcr.io/slakertop1/maelstrom-cli:latest   # published by CI to GHCR
+  script:
+    - maelstrom scenario.json
+        --out-json report.json
+        --out-html report.html
+        --max-error-rate 1
+        --max-p95 400
+  artifacts:
+    when: always
+    paths:
+      - report.html
+      - report.json
+    reports:
+      # exit code 1 on a breached threshold fails the job automatically
+  variables:
+    OAUTH_CLIENT_SECRET: $OAUTH_CLIENT_SECRET   # masked CI/CD variable, expanded via ${...} in scenario.json

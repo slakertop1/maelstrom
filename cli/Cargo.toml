@@ -1,0 +1,20 @@
+[package]
+name = "maelstrom-cli"
+version = "0.3.0"
+edition = "2021"
+description = "Maelstrom headless load-test runner for CI pipelines and Kubernetes"
+
+[[bin]]
+name = "maelstrom"
+path = "src/main.rs"
+
+[dependencies]
+maelstrom-core = { path = "../core" }
+maelstrom-db = { path = "../db" }
+maelstrom-grpc = { path = "../grpc" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-util = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

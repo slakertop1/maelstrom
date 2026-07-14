@@ -1,0 +1,14 @@
+[package]
+name = "maelstrom-db"
+version = "0.3.0"
+edition = "2021"
+description = "Shared SQL layer for Maelstrom (native Pg/MySQL/SQLite drivers, DB-backed datasets)"
+
+[dependencies]
+maelstrom-core = { path = "../core" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "uuid", "chrono", "json", "rust_decimal", "ipnetwork"] }
+tokio = { version = "1", features = ["time"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

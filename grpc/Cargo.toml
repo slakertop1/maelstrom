@@ -1,0 +1,31 @@
+[package]
+name = "maelstrom-grpc"
+version = "0.3.0"
+edition = "2021"
+description = "Dynamic gRPC client for Maelstrom: load .proto at runtime, unary/streaming calls, load testing"
+
+[dependencies]
+maelstrom-core = { path = "../core" }
+protox = "0.7"
+prost = "0.13"
+prost-reflect = { version = "0.14", features = ["serde"] }
+prost-types = "0.13"
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost", "tls", "tls-roots"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-util = "0.7"
+bytes = "1"
+http = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hdrhistogram = "7"
+
+[build-dependencies]
+protox = "0.7"
+tonic-build = "0.12"
+
+[dev-dependencies]
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+async-stream = "0.3"

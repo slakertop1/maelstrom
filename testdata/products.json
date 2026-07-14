@@ -1,0 +1,5 @@
+[
+  { "sku": "SKU-1001", "price": "4990", "title": "Coffee mug" },
+  { "sku": "SKU-1002", "price": "12900", "title": "Keyboard" },
+  { "sku": "SKU-1003", "price": "890", "title": "Sticker pack" }
+]

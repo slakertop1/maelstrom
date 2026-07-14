@@ -1,0 +1,28 @@
+{
+  "name": "maelstrom-demo-api",
+  "duration_secs": 20,
+  "timeout_ms": 10000,
+  "targets": [
+    {
+      "name": "list-products",
+      "method": "GET",
+      "url": "${BASE_URL}/api/products",
+      "rps": 40
+    },
+    {
+      "name": "get-product",
+      "method": "GET",
+      "url": "${BASE_URL}/api/products/2",
+      "rps": 30
+    },
+    {
+      "name": "create-order",
+      "method": "POST",
+      "url": "${BASE_URL}/api/orders",
+      "headers": [["Content-Type", "application/json"]],
+      "body": "{\"productId\":1,\"qty\":2}",
+      "rps": 15
+    }
+  ],
+  "thresholds": { "max_error_rate": 1.0, "max_p95_ms": 1500 }
+}

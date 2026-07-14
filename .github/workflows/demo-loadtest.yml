@@ -1,0 +1,32 @@
+# A REAL, runnable pipeline: load-test the live demo API with the Maelstrom CLI
+# (via the public GHCR image) and gate on thresholds. Run it from the Actions tab
+# (workflow_dispatch). This is the working counterpart of deploy/github-actions-example.yml.
+
+name: Demo load test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Load test the demo API (gates the job)
+        run: |
+          docker run --rm -v "$PWD/examples/demo-api:/work" -w /work \
+            -e BASE_URL=https://maelstrom-demo-api.cryptorelicday.workers.dev \
+            ghcr.io/slakertop1/maelstrom-cli:latest \
+            scenario.json \
+            --out-json report.json \
+            --out-html report.html \
+            --max-error-rate 1 \
+            --max-p95 800
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-report
+          path: examples/demo-api/report.*

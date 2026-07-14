@@ -1,0 +1,34 @@
+name: Build macOS
+
+# Собирает нативное приложение под macOS (universal: Intel + Apple Silicon).
+# Запуск вручную: вкладка Actions → Build macOS → Run workflow.
+# Или автоматически на тег v*.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Build universal .app + .dmg
+        run: npx tauri build --target universal-apple-darwin
+      - name: Upload macOS bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: Maelstrom-macos
+          path: |
+            target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            target/universal-apple-darwin/release/bundle/macos/*.app
+          if-no-files-found: error

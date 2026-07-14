@@ -1,0 +1,10 @@
+[workspace]
+members = ["src-tauri", "core", "cli", "db", "grpc"]
+resolver = "2"
+
+# Profiles must live at the workspace root; members inherit them.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

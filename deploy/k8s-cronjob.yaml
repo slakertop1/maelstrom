@@ -1,0 +1,40 @@
+# Recurring load test (e.g. nightly) as a CronJob. Reuses the ConfigMap and
+# Secret from k8s-job.yaml.
+#
+#   kubectl apply -f k8s-job.yaml       # for the ConfigMap + Secret
+#   kubectl apply -f k8s-cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: maelstrom-nightly
+spec:
+  schedule: "0 2 * * *"          # 02:00 every day
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: maelstrom
+              image: ghcr.io/slakertop1/maelstrom-cli:latest
+              args:
+                - /config/scenario.json
+                - --out-json
+                - /reports/report.json
+              envFrom:
+                - secretRef:
+                    name: maelstrom-secrets
+              volumeMounts:
+                - { name: scenario, mountPath: /config }
+                - { name: reports,  mountPath: /reports }
+          volumes:
+            - name: scenario
+              configMap:
+                name: maelstrom-scenario
+            - name: reports
+              emptyDir: {}

@@ -1,0 +1,47 @@
+openapi: 3.0.3
+info:
+  title: Maelstrom Mock
+  version: "1.0.0"
+  description: Локальный тестовый сервис (mock-server.mjs на 127.0.0.1:8900). Импортируйте кнопкой ↥.
+servers:
+  - url: http://127.0.0.1:8900
+components:
+  securitySchemes:
+    svc:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: http://127.0.0.1:8900/oauth/token
+          scopes: {}
+paths:
+  /api/hello:
+    get:
+      summary: Привет (простой GET)
+  /api/slow:
+    get:
+      summary: Медленный ответ (5-65 мс)
+  /api/flaky:
+    get:
+      summary: Нестабильный (~5% 500) — для доли ошибок в отчёте
+  /api/protected:
+    get:
+      summary: Защищённый ресурс (нужен OAuth-токен)
+      security:
+        - svc: []
+  /api/upload:
+    post:
+      summary: Загрузка файла (multipart)
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                avatar: { type: string, format: binary }
+  /api/echo:
+    get:
+      summary: Эхо query-параметров (для провайдеров данных)
+      parameters:
+        - { name: id, in: query, schema: { type: string } }
+        - { name: who, in: query, schema: { type: string } }

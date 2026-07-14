@@ -1,0 +1,57 @@
+# Example GitHub Actions job: run a Maelstrom load test as a pipeline gate.
+# The job FAILS when a threshold is breached (the CLI exits non-zero). The HTML
+# report is kept as an artifact. Secrets come from GitHub Actions secrets — the
+# scenario references them as ${VAR}, so they never live in the repo.
+#
+# Setup: commit your exported scenario.json to the repo and copy this file to
+# .github/workflows/ in your project.
+
+name: Load test
+
+on:
+  workflow_dispatch: # run manually…
+  # schedule:
+  #   - cron: "0 2 * * *"   # …or nightly, or on push to main — your call
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run load test (gates the job)
+        env:
+          # Maps a GitHub secret onto ${OAUTH_CLIENT_SECRET} inside scenario.json
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e OAUTH_CLIENT_SECRET \
+            ghcr.io/slakertop1/maelstrom-cli:latest \
+            scenario.json \
+            --out-json report.json \
+            --out-html report.html \
+            --max-error-rate 1 \
+            --max-p95 400
+          # a breached threshold -> exit 1 -> this step and the job fail
+
+      - name: Upload report
+        if: always() # keep the report even when the gate fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-report
+          path: |
+            report.html
+            report.json
+
+# --- No-Docker alternative: download the binary instead of the image ---
+#      - name: Get Maelstrom CLI
+#        run: |
+#          curl -sSL -o maelstrom \
+#            https://github.com/slakertop1/maelstrom-releases/releases/latest/download/maelstrom-linux-x64
+#          chmod +x maelstrom
+#      - name: Run load test
+#        env:
+#          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+#        run: |
+#          ./maelstrom scenario.json --out-json report.json --out-html report.html \
+#            --max-error-rate 1 --max-p95 400

@@ -1,0 +1,50 @@
+# Builds the headless CLI for Windows / macOS (universal) / Linux and uploads
+# each as a workflow artifact. Run on demand (workflow_dispatch); the binaries
+# are then attached to the GitHub Release. No RELEASE_TOKEN needed here.
+
+name: CLI binaries
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p maelstrom-cli
+      - run: Copy-Item target/release/maelstrom.exe maelstrom-windows-x64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maelstrom-cli-windows
+          path: maelstrom-windows-x64.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+      - run: |
+          cargo build --release -p maelstrom-cli --target aarch64-apple-darwin
+          cargo build --release -p maelstrom-cli --target x86_64-apple-darwin
+          lipo -create -output maelstrom-macos \
+            target/aarch64-apple-darwin/release/maelstrom \
+            target/x86_64-apple-darwin/release/maelstrom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maelstrom-cli-macos
+          path: maelstrom-macos
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p maelstrom-cli
+      - run: cp target/release/maelstrom maelstrom-linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maelstrom-cli-linux
+          path: maelstrom-linux-x64
