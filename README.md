@@ -5,11 +5,11 @@ databases in one app, plus a headless CLI for CI/Kubernetes.
 
 **Stack:** Tauri 2 · Rust (reqwest/rustls, tokio, sqlx, tonic, hdrhistogram) · React + TypeScript · Vite
 
-> [English](#english) · [Русский](#русский)
+> [English](#english) · [Русский](#русский) · [Changelog](CHANGELOG.md) · [Download](https://github.com/slakertop1/maelstrom-releases/releases)
 >
-> Internal developer documentation for the **private** code repo. Public,
-> user-facing docs live in [`community/README.md`](community/README.md) (mirrored
-> to the public releases repo). This file is more detailed than the public one.
+> Full developer documentation. A short user-facing quick-start is in
+> [`community/README.md`](community/README.md); the version-by-version update
+> history is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
@@ -221,18 +221,16 @@ cd examples/demo-api && wrangler deploy # deploy the demo API (Cloudflare Worker
 
 ### Distribution model
 
-**Private code repo** (this) + **public releases repo**
-(`slakertop1/maelstrom-releases`: README/landing, Issues, Discussions, Releases,
-`deploy/`, `examples/`). Source stays private; only built artifacts and
-user-facing docs are published. The CLI image lives in GHCR.
+**Public code repo** (this, `slakertop1/maelstrom`) + a **releases/landing repo**
+(`slakertop1/maelstrom-releases`: user-facing README, Issues, Discussions, and the
+published Releases with the desktop/CLI binaries). The CLI image lives in GHCR.
+The version-by-version update history is in [`CHANGELOG.md`](CHANGELOG.md).
 
-**Cutting a release** (SemVer; `0.x` while in beta — MINOR for features, PATCH
-for fixes):
+**Cutting a release** (SemVer; `0.x` — MINOR for features, PATCH for fixes):
 1. Bump `version` in `core/db/grpc/cli/src-tauri` `Cargo.toml`,
    `src-tauri/tauri.conf.json`, and the image tag in `docker-cli.yml`.
-2. Update `CHANGELOG.md`.
-3. Commit, tag `vX.Y.Z`; CI builds and publishes (with `RELEASE_TOKEN`), or do it
-   manually.
+2. Add a section to [`CHANGELOG.md`](CHANGELOG.md).
+3. Commit, tag `vX.Y.Z`; CI builds and publishes the assets, or do it manually.
 
 ### Roadmap
 
@@ -462,17 +460,16 @@ cd examples/demo-api && wrangler deploy # деплой demo-API (Cloudflare Work
 
 ### Модель распространения
 
-**Приватный репо с кодом** (этот) + **публичный релиз-репо**
-(`slakertop1/maelstrom-releases`: README/лендинг, Issues, Discussions, Releases,
-`deploy/`, `examples/`). Исходники приватны; публикуются только собранные
-артефакты и пользовательские доки. Образ CLI — в GHCR.
+**Публичный репо с кодом** (этот, `slakertop1/maelstrom`) + **релиз-репо/лендинг**
+(`slakertop1/maelstrom-releases`: пользовательский README, Issues, Discussions и
+опубликованные Releases с бинарниками десктопа/CLI). Образ CLI — в GHCR.
+Полная история версий — в [`CHANGELOG.md`](CHANGELOG.md).
 
-**Выпуск релиза** (SemVer; `0.x` в бете — MINOR на фичи, PATCH на фиксы):
+**Выпуск релиза** (SemVer; `0.x` — MINOR на фичи, PATCH на фиксы):
 1. Поднять `version` в `core/db/grpc/cli/src-tauri` `Cargo.toml`,
    `src-tauri/tauri.conf.json` и тег образа в `docker-cli.yml`.
-2. Обновить `CHANGELOG.md`.
-3. Коммит, тег `vX.Y.Z`; CI собирает и публикует (с `RELEASE_TOKEN`) или делаешь
-   вручную.
+2. Добавить секцию в [`CHANGELOG.md`](CHANGELOG.md).
+3. Коммит, тег `vX.Y.Z`; CI собирает и публикует ассеты, или делаешь вручную.
 
 ### Дорожная карта
 
