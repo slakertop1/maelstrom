@@ -67,6 +67,40 @@ export const ru: Record<string, string> = {
   "Save the current auth settings as a reusable profile":
     "Сохранить текущие настройки авторизации как переиспользуемый профиль",
   "Save as profile": "Сохранить как профиль",
+
+  // ---- streams (request chaining) ----
+  "Chained load (streams)": "Нагрузка цепочками (потоки)",
+  "Chained load (streams): multi-step scenarios with value passing":
+    "Нагрузка цепочками (потоки): многошаговые сценарии с передачей значений",
+  "Add stream": "Добавить поток",
+  "Add a stream. A stream fires its steps in order at its own rate (iterations/sec); one step = single load, several = a chain. Extract a value from a step's response to use as {{var}} in the next.":
+    "Добавьте поток. Поток гонит свои шаги по порядку со своим темпом (итераций/сек); один шаг = одиночная нагрузка, несколько = цепочка. Извлеки значение из ответа шага, чтобы использовать как {{var}} в следующем.",
+  "iters/sec": "итер/с",
+  "Chain iterations started per second (open model). Each step sees ≈ this rate.":
+    "Стартов цепочки в секунду (открытая модель). Каждый шаг видит ≈ этот темп.",
+  step: "шаг",
+  "Delete stream": "Удалить поток",
+  "No steps yet — add a request as the first step.":
+    "Пока нет шагов — добавьте запрос первым шагом.",
+  "Move up": "Вверх",
+  "Move down": "Вниз",
+  "Delete step": "Удалить шаг",
+  var: "перем",
+  header: "заголовок",
+  "Remove extract": "Убрать extract",
+  "Extract a value from this step's response into a variable for later steps":
+    "Извлечь значение из ответа этого шага в переменную для следующих шагов",
+  "{n} runnable stream(s)": "потоков к запуску: {n}",
+  "unset variables: {vars}": "не заданы переменные: {vars}",
+  Stream: "Поток",
+  Iterations: "Итераций",
+  "{done}/{started} chains completed ({rate}%)":
+    "цепочек завершено {done}/{started} ({rate}%)",
+  "{n} not sent": "не отправлено: {n}",
+  "(deleted)": "(удалён)",
+  "run the chained load test": "запустить нагрузку цепочками",
+  "No runnable streams (every step's request is missing).":
+    "Нет потоков к запуску (запросы шагов отсутствуют).",
   "Example: database password.": "Пример: пароль от базы данных.",
   "Add a variable named": "Заведите переменную с именем",
   ", put your local password in the value and mark it":

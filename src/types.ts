@@ -377,6 +377,113 @@ export interface ScenarioResult {
   stopped_early: boolean;
 }
 
+// ---- request chaining (streams) — mirrors core/src/types.rs ----
+
+export interface ExtractRule {
+  name: string;
+  from: "json" | "header" | "regex";
+  expr: string;
+}
+
+export interface StreamStepSpec {
+  name: string;
+  method: string;
+  url: string;
+  headers: [string, string][];
+  body: string | null;
+  tls: TlsSpec | null;
+  multipart: MultipartPartSpec[] | null;
+  extract: ExtractRule[];
+}
+
+export interface StreamSpec {
+  name: string;
+  rps: number; // iterations (chains) per second — open model
+  steps: StreamStepSpec[];
+}
+
+export interface StreamScenarioSpec {
+  duration_secs: number;
+  timeout_ms: number;
+  streams: StreamSpec[];
+  datasets: DatasetSpec[];
+  file_pools: FilePoolSpec[];
+}
+
+export interface StreamResult {
+  name: string;
+  steps: LoadTestResult[]; // per-step (per-endpoint), in order — funnel
+  iterations_started: number;
+  iterations_completed: number;
+  success_rate: number;
+  e2e_avg_ms: number;
+  e2e_p50_ms: number;
+  e2e_p95_ms: number;
+  e2e_p99_ms: number;
+  dropped: number;
+}
+
+export interface StreamsResult {
+  started_at: string;
+  duration_secs: number;
+  actual_duration_ms: number;
+  overall: LoadTestResult;
+  streams: StreamResult[];
+  stopped_early: boolean;
+}
+
+export interface StreamProgress {
+  name: string;
+  iterations: number;
+  iters_per_sec: number;
+  errors: number;
+}
+
+export interface StreamsProgress {
+  elapsed_secs: number;
+  overall_total: number;
+  overall_errors: number;
+  overall_rps: number;
+  overall_p95_ms: number;
+  streams: StreamProgress[];
+}
+
+// ---- UI model for building streams (before → StreamSpec at run/export) ----
+
+export interface UiExtract {
+  id: string;
+  name: string;
+  from: "json" | "header" | "regex";
+  expr: string;
+}
+
+/// A step in the UI streams builder: a request pinned by its collection id,
+/// plus what to extract from its response.
+export interface UiStreamStep {
+  id: string;
+  requestId: string; // an HTTP request in the scenario collection
+  extract: UiExtract[];
+}
+
+export interface UiStream {
+  id: string;
+  name: string;
+  rps: number;
+  steps: UiStreamStep[];
+}
+
+export function newUiExtract(): UiExtract {
+  return { id: uid(), name: "", from: "json", expr: "" };
+}
+
+export function newUiStreamStep(requestId: string): UiStreamStep {
+  return { id: uid(), requestId, extract: [] };
+}
+
+export function newUiStream(n: number): UiStream {
+  return { id: uid(), name: `stream${n}`, rps: 50, steps: [] };
+}
+
 export interface TimelinePoint {
   sec: number;
   requests: number;

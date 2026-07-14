@@ -14,6 +14,7 @@ import {
   startDbLoadTest,
   startLoadTest,
   startScenarioLoadTest,
+  startStreamsLoadTest,
   stopLoadTest,
   wsCall,
   wsStartLoad,
@@ -34,6 +35,8 @@ import GrpcResultView from "./components/GrpcResultView";
 import WsResultView from "./components/WsResultView";
 import LoadTestPanel, { LoadTestConfig } from "./components/LoadTestPanel";
 import ScenarioPanel, { ScenarioRunConfig, looksLikeDatasetTypo } from "./components/ScenarioPanel";
+import StreamsPanel, { StreamRunConfig } from "./components/StreamsPanel";
+import { buildStreamsScenario, streamsMissingVars } from "./streamsBuilder";
 import EnvironmentModal from "./components/EnvironmentModal";
 import DatasetsModal from "./components/DatasetsModal";
 import LogModal from "./components/LogModal";
@@ -62,6 +65,9 @@ import {
   RequestConfig,
   ScenarioProgress,
   ScenarioResult,
+  StreamsProgress,
+  StreamsResult,
+  UiStream,
   ScenarioTargetSpec,
   TimelinePoint,
   TlsConfig,
@@ -145,6 +151,12 @@ export default function App() {
   const [scProgressLog, setScProgressLog] = useState<ScenarioProgress[]>([]);
   const [scResult, setScResult] = useState<ScenarioResult | null>(null);
   const [scError, setScError] = useState<string | null>(null);
+  // Streams (request chaining) panel.
+  const [streamsColId, setStreamsColId] = useState<string | null>(null);
+  const [stRunning, setStRunning] = useState(false);
+  const [stProgress, setStProgress] = useState<StreamsProgress | null>(null);
+  const [stResult, setStResult] = useState<StreamsResult | null>(null);
+  const [stError, setStError] = useState<string | null>(null);
 
   // Недавние Token URL — общая коллекция подсказок для всех запросов.
   const [tokenUrls, setTokenUrls] = useState<string[]>([]);
@@ -273,6 +285,17 @@ export default function App() {
     listen<string>("scenario_error", (e) => {
       setScError(e.payload);
       setScRunning(false);
+    }).then((u) => unsubs.push(u));
+    listen<StreamsProgress>("streams_progress", (e) => setStProgress(e.payload)).then((u) =>
+      unsubs.push(u)
+    );
+    listen<StreamsResult>("streams_finished", (e) => {
+      setStResult(e.payload);
+      setStRunning(false);
+    }).then((u) => unsubs.push(u));
+    listen<string>("streams_error", (e) => {
+      setStError(e.payload);
+      setStRunning(false);
     }).then((u) => unsubs.push(u));
     listen<number>("token_refreshed", (e) => {
       setTokenRefreshes(e.payload);
@@ -685,6 +708,67 @@ export default function App() {
     executeScenario(targets, filePools, config);
   };
 
+  // ---- streams (request chaining) load ----
+  const openStreams = (collectionId: string) => {
+    setStreamsColId(collectionId);
+    setStResult(null);
+    setStProgress(null);
+    setStError(null);
+  };
+  const closeStreams = () => {
+    if (stRunning) stopLoadTest().catch(() => {});
+    setStreamsColId(null);
+  };
+  const streamsCollection = collections.find((c) => c.id === streamsColId) ?? null;
+
+  const streamsMissingVarsCb = useCallback(
+    (uiStreams: UiStream[]) => {
+      if (!streamsCollection) return [];
+      const byId = new Map(streamsCollection.requests.map((r) => [r.id, r]));
+      return streamsMissingVars(uiStreams, byId, activeEnv);
+    },
+    [streamsCollection, activeEnv]
+  );
+
+  const executeStreams = async (config: StreamRunConfig) => {
+    if (!streamsCollection) return;
+    setStError(null);
+    setStResult(null);
+    setStProgress(null);
+    try {
+      const byId = new Map(streamsCollection.requests.map((r) => [r.id, r]));
+      const spec = buildStreamsScenario(
+        config.streams,
+        byId,
+        activeEnv,
+        config.durationSecs,
+        config.timeoutMs,
+        datasets.filter((d) => d.name.trim()).map(toDatasetSpec)
+      );
+      if (spec.streams.length === 0) {
+        setStError(t("No runnable streams (every step's request is missing)."));
+        return;
+      }
+      await startStreamsLoadTest(spec);
+      setStRunning(true);
+    } catch (e) {
+      setStError(String(e));
+    }
+  };
+
+  const startStreams = (config: StreamRunConfig) => {
+    const missing = streamsMissingVarsCb(config.streams);
+    if (missing.length) {
+      setPreflight({
+        missing,
+        action: t("run the chained load test"),
+        proceed: () => executeStreams(config),
+      });
+      return;
+    }
+    executeStreams(config);
+  };
+
   const buildScenarioTargets = (
     config: ScenarioRunConfig,
     forExport = false
@@ -969,6 +1053,7 @@ export default function App() {
           onDeleteCollection={deleteCollection}
           onRenameCollection={renameCollection}
           onLoadService={openScenario}
+          onStreams={openStreams}
         />
         <div className="workspace">
           <div className="split">
@@ -1042,6 +1127,19 @@ export default function App() {
           onClose={closeScenario}
           tokenRefreshes={tokenRefreshes}
           missingVars={scenarioMissingVars}
+        />
+      )}
+      {streamsCollection && (
+        <StreamsPanel
+          collection={streamsCollection}
+          running={stRunning}
+          progress={stProgress}
+          result={stResult}
+          error={stError}
+          onStart={startStreams}
+          onStop={doStopLoadTest}
+          onClose={closeStreams}
+          missingVars={streamsMissingVarsCb}
         />
       )}
       {datasetsModalOpen && (

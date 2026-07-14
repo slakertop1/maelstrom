@@ -1,5 +1,6 @@
 mod db;
 mod grpc;
+mod streams;
 mod http_client;
 mod loadtest;
 mod log;
@@ -19,6 +20,7 @@ pub fn run() {
             loadtest::start_load_test,
             loadtest::stop_load_test,
             scenario::start_scenario_load_test,
+            streams::start_streams_load_test,
             oauth::fetch_oauth_token,
             oauth::oauth_authorization_code,
             db::db_execute,

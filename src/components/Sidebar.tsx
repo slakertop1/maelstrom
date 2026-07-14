@@ -13,6 +13,7 @@ interface Props {
   onDeleteCollection: (collectionId: string) => void;
   onRenameCollection: (collectionId: string, name: string) => void;
   onLoadService: (collectionId: string) => void;
+  onStreams: (collectionId: string) => void;
 }
 
 export default function Sidebar(p: Props) {
@@ -93,6 +94,16 @@ export default function Sidebar(p: Props) {
                   }}
                 >
                   ⚡
+                </button>
+                <button
+                  className="ghost"
+                  title={t("Chained load (streams): multi-step scenarios with value passing")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    p.onStreams(col.id);
+                  }}
+                >
+                  🔗
                 </button>
                 <button
                   className="ghost"

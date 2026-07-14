@@ -13,6 +13,7 @@ import type {
   OAuthTokenResponse,
   PersistedState,
   ScenarioSpec,
+  StreamScenarioSpec,
   TlsSpec,
   WsCallResult,
 } from "./types";
@@ -41,6 +42,10 @@ export async function stopLoadTest(): Promise<void> {
 
 export async function startScenarioLoadTest(spec: ScenarioSpec): Promise<void> {
   return invoke("start_scenario_load_test", { spec });
+}
+
+export async function startStreamsLoadTest(spec: StreamScenarioSpec): Promise<void> {
+  return invoke("start_streams_load_test", { spec });
 }
 
 export async function dbExecute(spec: {
