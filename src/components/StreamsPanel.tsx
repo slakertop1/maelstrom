@@ -333,7 +333,7 @@ export default function StreamsPanel(p: Props) {
             <OverallCards progress={p.progress} result={p.result} running={p.running} />
 
             {p.result &&
-              p.result.streams.map((s) => <StreamResultView key={s.name} s={s} />)}
+              p.result.streams.map((s, i) => <StreamResultView key={i} s={s} />)}
 
             {p.running && p.progress && (
               <table className="scenario-table result">

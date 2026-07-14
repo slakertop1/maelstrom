@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildStreamsScenario, streamsMissingVars } from "./streamsBuilder";
-import { newRequest, RequestConfig, UiStream, DatasetSpec } from "./types";
+import { newRequest, newMultipartField, RequestConfig, UiStream, DatasetSpec } from "./types";
 
 function req(name: string, patch: Partial<RequestConfig> = {}): RequestConfig {
   return { ...newRequest(name), ...patch };
@@ -73,6 +73,59 @@ describe("buildStreamsScenario", () => {
     ];
     const spec = buildStreamsScenario(streams, new Map(), null, 10, 5000, []);
     expect(spec.streams).toHaveLength(0);
+  });
+
+  it("carries multipart and TLS from a step's request into the spec", () => {
+    const r = req("upload", {
+      method: "POST",
+      url: "https://api/upload",
+      body_type: "multipart",
+      multipart_body: [{ ...newMultipartField("text"), name: "field", value: "v", enabled: true }],
+      tls: { enabled: true, client_cert_pem: "PEM", client_key_pem: "", ca_cert_pem: "", insecure: false },
+    });
+    const spec = buildStreamsScenario(
+      [ui({ steps: [{ id: "s", requestId: r.id, extract: [] }] })],
+      byIdOf([r]),
+      null,
+      10,
+      5000,
+      []
+    );
+    const step = spec.streams[0].steps[0];
+    expect(step.multipart).not.toBeNull();
+    expect(step.multipart?.[0].name).toBe("field");
+    expect(step.tls).not.toBeNull();
+  });
+
+  it("collects file pools from a step whose multipart file field uses a pool", () => {
+    const r = req("upimg", {
+      method: "POST",
+      url: "https://api/img",
+      body_type: "multipart",
+      multipart_body: [
+        {
+          ...newMultipartField("file"),
+          name: "photo",
+          enabled: true,
+          source: "pool",
+          pool_kind: "folder",
+          pool_path: "C:/imgs",
+          pool_mask: "*.jpg",
+        },
+      ],
+    });
+    const spec = buildStreamsScenario(
+      [ui({ steps: [{ id: "s", requestId: r.id, extract: [] }] })],
+      byIdOf([r]),
+      null,
+      10,
+      5000,
+      []
+    );
+    expect(spec.file_pools).toHaveLength(1);
+    expect(spec.file_pools[0].source.kind).toBe("folder");
+    const p = spec.streams[0].steps[0].multipart?.find((x) => x.name === "photo");
+    expect(p?.value).toContain("{{$file.");
   });
 
   it("attaches datasets only when a step references {{$data.*}}", () => {

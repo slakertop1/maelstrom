@@ -204,6 +204,43 @@ impl<'a> RequestCtx<'a> {
     }
 }
 
+/// Substitute `{{name}}` with a known chain variable (from request chaining).
+/// Unknown names and the dynval generators (`{{$...}}`, whose name starts with
+/// `$`) are left intact for the per-request [`RequestCtx::expand`] pass. Empty
+/// var maps short-circuit to a borrow-free no-op.
+pub fn apply_chain_vars(s: &str, vars: &HashMap<String, String>) -> String {
+    if vars.is_empty() || !s.contains("{{") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find("{{") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 2..];
+        match after.find("}}") {
+            Some(end) => {
+                let inner = after[..end].trim();
+                match vars.get(inner) {
+                    Some(val) => out.push_str(val),
+                    None => {
+                        out.push_str("{{");
+                        out.push_str(&after[..end]);
+                        out.push_str("}}");
+                    }
+                }
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str("{{");
+                rest = after;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn parse_two_ints(args: &str) -> Option<(i64, i64)> {
     let mut it = args.split(',');
     let a = it.next()?.trim().parse().ok()?;

@@ -1,6 +1,6 @@
 [package]
 name = "maelstrom-cli"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Maelstrom headless load-test runner for CI pipelines and Kubernetes"
 
@@ -18,3 +18,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-util = "0.7"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+# in-process mock HTTP server for the streams-gate integration test
+tokio = { version = "1", features = ["full"] }

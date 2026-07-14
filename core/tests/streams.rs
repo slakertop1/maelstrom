@@ -31,6 +31,8 @@ struct MockState {
     echoes: Mutex<Vec<String>>,
     /// Content-Type header values seen on /multi
     multi_content_types: Mutex<Vec<String>>,
+    /// Raw request text seen on /multi (to assert what a multipart field carried)
+    multi_bodies: Mutex<Vec<String>>,
     login_seq: AtomicU64,
 }
 
@@ -101,6 +103,7 @@ async fn spawn_mock() -> (String, Arc<MockState>) {
                 } else if target.starts_with("/multi") {
                     let ct = header("content-type").unwrap_or_default();
                     st.multi_content_types.lock().unwrap().push(ct);
+                    st.multi_bodies.lock().unwrap().push(req.clone());
                     ("200 OK", "{\"ok\":true}".to_string())
                 } else {
                     ("404 Not Found", "{}".to_string())
@@ -328,6 +331,85 @@ async fn multipart_step_sends_multipart_content_type() {
         "multipart wiring intact: {:?}",
         cts.first()
     );
+}
+
+// The extracted token must be threaded into a MULTIPART text field too, not just
+// url/header/body — a login → upload chain is a supported combination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chain_variable_is_substituted_in_multipart_text_field() {
+    let (base, st) = spawn_mock().await;
+    let mut login = step("login", "POST", format!("{base}/login"));
+    login.extract = vec![extract("token", "json", "data.token")];
+    let mut upload = step("upload", "POST", format!("{base}/multi"));
+    upload.multipart = Some(vec![MultipartPart {
+        name: "auth".into(),
+        kind: "text".into(),
+        value: "Bearer {{token}}".into(),
+        filename: None,
+        content_type: None,
+        enabled: true,
+    }]);
+
+    let result = run(spec(vec![StreamSpec {
+        name: "mp-chain".into(),
+        rps: 20,
+        steps: vec![login, upload],
+    }]))
+    .await;
+
+    assert!(result.streams[0].iterations_completed > 5);
+    let bodies = st.multi_bodies.lock().unwrap();
+    assert!(!bodies.is_empty());
+    for b in bodies.iter() {
+        assert!(b.contains("Bearer T-"), "the extracted token must reach the multipart field");
+        assert!(!b.contains("{{token}}"), "the literal placeholder must NOT be sent");
+    }
+}
+
+// The Stop button / Ctrl-C path: cancelling the token mid-run must halt promptly
+// and set stopped_early — not run to the (long) configured duration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_stops_run_and_sets_stopped_early() {
+    let (base, _st) = spawn_mock().await;
+    let mut sp = spec(vec![StreamSpec {
+        name: "long".into(),
+        rps: 20,
+        steps: vec![step("s", "GET", format!("{base}/echo?x=1"))],
+    }]);
+    sp.duration_secs = 30; // long; we cancel far earlier
+
+    let cancel = CancellationToken::new();
+    let cancel2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancel2.cancel();
+    });
+
+    let start = std::time::Instant::now();
+    let result = run_streams(sp, cancel, Arc::new(|_| {}), no_log()).await.unwrap();
+    assert!(start.elapsed().as_secs() < 10, "cancel must stop well before 30s");
+    assert!(result.stopped_early, "stopped_early must be set when cancelled");
+    assert!(result.streams[0].iterations_started > 0, "some iterations ran before cancel");
+}
+
+// Backpressure safety valve: when the target can't keep up, in-flight iterations
+// hit the 2×rps cap and excess arrivals are COUNTED as dropped (not silently lost
+// and not grown without bound).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backpressure_drops_when_target_saturated() {
+    let (base, _st) = spawn_mock().await;
+    let mut sp = spec(vec![StreamSpec {
+        name: "flood".into(),
+        rps: 60, // cap = 120; against a 3s endpoint in-flight climbs past it
+        steps: vec![step("slow", "GET", format!("{base}/slow"))],
+    }]);
+    sp.duration_secs = 3;
+    sp.timeout_ms = 6000; // > 3s so requests complete rather than error out
+
+    let result = run(sp).await;
+    let s = &result.streams[0];
+    assert!(s.dropped > 0, "expected shed iterations under saturation, got {}", s.dropped);
+    assert_eq!(result.overall.dropped, s.dropped, "overall dropped == sum of per-stream");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

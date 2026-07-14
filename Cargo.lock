@@ -2597,7 +2597,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "maelstrom-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "maelstrom-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "clap",
@@ -2636,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "maelstrom-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "maelstrom-db"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "maelstrom-core",
@@ -2666,7 +2666,7 @@ dependencies = [
 
 [[package]]
 name = "maelstrom-grpc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-stream",
  "bytes",

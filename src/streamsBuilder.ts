@@ -77,17 +77,18 @@ export function streamsMissingVars(
   byId: Map<string, RequestConfig>,
   env: Environment | null
 ): string[] {
-  const all: (string | null)[] = [];
+  // Extracted vars are chain-scoped (per stream) at runtime, so a var extracted
+  // in stream A must NOT silence the same {{var}} used unextracted in stream B.
+  // Check each stream against ITS OWN extracted names, then union the leftovers.
+  const missing = new Set<string>();
   for (const s of uiStreams) {
+    const strings: (string | null)[] = [];
     for (const st of s.steps) {
       const req = byId.get(st.requestId);
-      if (req) all.push(...builtStrings(buildRequest(req, env)));
+      if (req) strings.push(...builtStrings(buildRequest(req, env)));
     }
+    const extracted = new Set(s.steps.flatMap((st) => st.extract.map((e) => e.name.trim())));
+    for (const v of unresolvedVars(strings)) if (!extracted.has(v)) missing.add(v);
   }
-  // A header like `Authorization: Bearer {{token}}` referencing an EXTRACTED
-  // var must NOT be flagged as a missing env var — it's threaded at runtime.
-  const extracted = new Set(
-    uiStreams.flatMap((s) => s.steps.flatMap((st) => st.extract.map((e) => e.name.trim())))
-  );
-  return unresolvedVars(all).filter((v) => !extracted.has(v));
+  return [...missing];
 }

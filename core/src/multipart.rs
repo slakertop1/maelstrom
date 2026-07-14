@@ -121,11 +121,24 @@ pub fn prepare_parts(parts: &[MultipartPart]) -> Result<Vec<PreparedPart>, Strin
 /// Build a fresh multipart Form from prepared parts (cheap byte copies). Text
 /// parts get per-request dynamic expansion; file bytes are reused as-is.
 pub fn form_from_prepared(prepared: &[PreparedPart], ctx: &RequestCtx) -> Form {
+    form_from_prepared_vars(prepared, ctx, &std::collections::HashMap::new())
+}
+
+/// Like [`form_from_prepared`], but chain-scoped `{{vars}}` (from request
+/// chaining) are substituted in text values and filename overrides BEFORE the
+/// dynval `{{$...}}` expansion — mirroring the URL/header/body path so a
+/// multipart field carrying an extracted token isn't sent literally.
+pub fn form_from_prepared_vars(
+    prepared: &[PreparedPart],
+    ctx: &RequestCtx,
+    vars: &std::collections::HashMap<String, String>,
+) -> Form {
     let mut form = Form::new();
     for p in prepared {
         match &p.data {
             Prepared::Text(v) => {
-                form = form.text(p.name.clone(), ctx.expand(v));
+                // Chain vars first, then dynval generators (same order as URL/body).
+                form = form.text(p.name.clone(), ctx.expand(&crate::dynval::apply_chain_vars(v, vars)));
             }
             Prepared::File { bytes, filename, mime } => {
                 form = form.part(p.name.clone(), file_part(bytes, filename, mime.as_deref()));

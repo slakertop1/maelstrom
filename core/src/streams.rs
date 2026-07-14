@@ -14,8 +14,8 @@
 //! this is an additive path. The per-request accumulator (`TargetAcc`) and
 //! finalization are reused from `scenario` so per-step stats never drift.
 
-use crate::dynval::DynState;
-use crate::multipart::{form_from_prepared, prepare_parts, PreparedPart};
+use crate::dynval::{apply_chain_vars, DynState};
+use crate::multipart::{form_from_prepared_vars, prepare_parts, PreparedPart};
 use crate::scenario::{LogFn, TargetAcc};
 use crate::types::*;
 use hdrhistogram::Histogram;
@@ -45,9 +45,17 @@ struct PreparedStep {
     headers: Vec<(String, String)>,
     body: Option<String>,
     multipart: Option<Arc<Vec<PreparedPart>>>,
-    extract: Vec<ExtractRule>,
+    extract: Vec<PreparedExtract>,
     needs_body: bool,
     needs_headers: bool,
+}
+
+/// An extract rule with its regex compiled ONCE (regex compilation costs far
+/// more than matching; doing it per response would cap throughput and inflate
+/// the reported end-to-end latency). Non-regex rules carry `regex: None`.
+struct PreparedExtract {
+    rule: ExtractRule,
+    regex: Option<regex::Regex>,
 }
 
 struct PreparedStream {
@@ -124,6 +132,31 @@ pub async fn run_streams(
             let needs_headers = st.extract.iter().any(|e| e.from == "header");
             let needs_body = st.extract.iter().any(|e| e.from != "header");
 
+            // Compile each regex extract rule once, up front. A bad pattern is
+            // logged here (not silently unset on every request) and disables
+            // just that rule.
+            let extract: Vec<PreparedExtract> = st
+                .extract
+                .iter()
+                .map(|r| {
+                    let regex = if r.from == "regex" {
+                        match regex::Regex::new(&r.expr) {
+                            Ok(re) => Some(re),
+                            Err(e) => {
+                                log(format!(
+                                    "⚠ поток «{}»/«{}»: неверное regex-правило «{}»: {e}",
+                                    s.name, st.name, r.name
+                                ));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    PreparedExtract { rule: r.clone(), regex }
+                })
+                .collect();
+
             steps.push(PreparedStep {
                 client,
                 method,
@@ -131,7 +164,7 @@ pub async fn run_streams(
                 headers,
                 body: st.body.clone(),
                 multipart,
-                extract: st.extract.clone(),
+                extract,
                 needs_body,
                 needs_headers,
             });
@@ -279,9 +312,9 @@ async fn run_iteration(
             ok = false;
             break;
         }
-        for rule in &step.extract {
-            if let Some(val) = extract_value(rule, body.as_deref(), &headers) {
-                vars.insert(rule.name.clone(), val);
+        for pe in &step.extract {
+            if let Some(val) = extract_value(pe, body.as_deref(), &headers) {
+                vars.insert(pe.rule.name.clone(), val);
             }
         }
     }
@@ -301,19 +334,20 @@ async fn send_step(
     // !Sync RefCell) is dropped BEFORE the await below — keeps this future Send.
     let req = {
         let ctx = dyn_state.request();
-        let url = ctx.expand(&apply_vars(&step.url, vars));
+        let url = ctx.expand(&apply_chain_vars(&step.url, vars));
         let mut req = step.client.request(step.method.clone(), url);
         for (k, v) in &step.headers {
             if step.multipart.is_some() && k.trim().eq_ignore_ascii_case("content-type") {
                 continue;
             }
-            req = req.header(k.trim(), ctx.expand(&apply_vars(v, vars)));
+            req = req.header(k.trim(), ctx.expand(&apply_chain_vars(v, vars)));
         }
         if let Some(parts) = &step.multipart {
-            req = req.multipart(form_from_prepared(parts, &ctx));
+            // vars threaded into multipart text fields too (login → upload chains).
+            req = req.multipart(form_from_prepared_vars(parts, &ctx, vars));
         } else if let Some(b) = &step.body {
             if !b.is_empty() {
-                req = req.body(ctx.expand(&apply_vars(b, vars)));
+                req = req.body(ctx.expand(&apply_chain_vars(b, vars)));
             }
         }
         req
@@ -341,54 +375,20 @@ async fn send_step(
     }
 }
 
-/// Substitute `{{name}}` with a known chain variable. Unknown names and the
-/// dynval generators (`{{$...}}`, whose name starts with `$`) are left intact.
-fn apply_vars(s: &str, vars: &HashMap<String, String>) -> String {
-    if vars.is_empty() || !s.contains("{{") {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(pos) = rest.find("{{") {
-        out.push_str(&rest[..pos]);
-        let after = &rest[pos + 2..];
-        match after.find("}}") {
-            Some(end) => {
-                let inner = after[..end].trim();
-                match vars.get(inner) {
-                    Some(val) => out.push_str(val),
-                    None => {
-                        out.push_str("{{");
-                        out.push_str(&after[..end]);
-                        out.push_str("}}");
-                    }
-                }
-                rest = &after[end + 2..];
-            }
-            None => {
-                out.push_str("{{");
-                rest = after;
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 fn extract_value(
-    rule: &ExtractRule,
+    pe: &PreparedExtract,
     body: Option<&str>,
     headers: &[(String, String)],
 ) -> Option<String> {
+    let rule = &pe.rule;
     match rule.from.as_str() {
         "header" => headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(rule.expr.trim()))
             .map(|(_, v)| v.clone()),
         "regex" => {
-            let re = regex::Regex::new(&rule.expr).ok()?;
-            let caps = re.captures(body?)?;
+            // Precompiled at build time; None means the pattern was invalid.
+            let caps = pe.regex.as_ref()?.captures(body?)?;
             caps.get(1).or_else(|| caps.get(0)).map(|m| m.as_str().to_string())
         }
         // default: JSON dot/bracket path (e.g. data.items.0.token)
@@ -598,13 +598,13 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("token".to_string(), "abc123".to_string());
         // known var replaced
-        assert_eq!(apply_vars("Bearer {{token}}", &vars), "Bearer abc123");
+        assert_eq!(apply_chain_vars("Bearer {{token}}", &vars), "Bearer abc123");
         // generator ({{$...}}) and unknown name left intact for the next pass
-        assert_eq!(apply_vars("{{$uuid}}/{{missing}}/{{token}}", &vars), "{{$uuid}}/{{missing}}/abc123");
+        assert_eq!(apply_chain_vars("{{$uuid}}/{{missing}}/{{token}}", &vars), "{{$uuid}}/{{missing}}/abc123");
         // whitespace tolerated
-        assert_eq!(apply_vars("{{ token }}", &vars), "abc123");
+        assert_eq!(apply_chain_vars("{{ token }}", &vars), "abc123");
         // no braces → unchanged
-        assert_eq!(apply_vars("plain", &vars), "plain");
+        assert_eq!(apply_chain_vars("plain", &vars), "plain");
     }
 
     #[test]
@@ -613,15 +613,15 @@ mod tests {
         vars.insert("a".to_string(), "1".to_string());
         vars.insert("b".to_string(), "2".to_string());
         // adjacent placeholders
-        assert_eq!(apply_vars("{{a}}{{b}}", &vars), "12");
+        assert_eq!(apply_chain_vars("{{a}}{{b}}", &vars), "12");
         // dataset refs ({{$data...}}) untouched — expanded later by dynval
-        assert_eq!(apply_vars("{{$data.u.id}}-{{a}}", &vars), "{{$data.u.id}}-1");
+        assert_eq!(apply_chain_vars("{{$data.u.id}}-{{a}}", &vars), "{{$data.u.id}}-1");
         // unclosed marker survives verbatim
-        assert_eq!(apply_vars("x {{a}} tail {{oops", &vars), "x 1 tail {{oops");
+        assert_eq!(apply_chain_vars("x {{a}} tail {{oops", &vars), "x 1 tail {{oops");
         // empty vars → fast path, unchanged
-        assert_eq!(apply_vars("{{a}}", &HashMap::new()), "{{a}}");
+        assert_eq!(apply_chain_vars("{{a}}", &HashMap::new()), "{{a}}");
         // non-ASCII around placeholders preserved
-        assert_eq!(apply_vars("токен={{a}} мир", &vars), "токен=1 мир");
+        assert_eq!(apply_chain_vars("токен={{a}} мир", &vars), "токен=1 мир");
     }
 
     #[test]
@@ -634,23 +634,25 @@ mod tests {
         assert!(json_path(&v, "data.missing").is_none());
     }
 
+    /// Build a PreparedExtract the same way the engine does (regex compiled up
+    /// front; invalid regex → None, disabling just that rule).
+    fn pe(from: &str, expr: &str) -> PreparedExtract {
+        PreparedExtract {
+            rule: ExtractRule { name: "x".into(), from: from.into(), expr: expr.into() },
+            regex: if from == "regex" { regex::Regex::new(expr).ok() } else { None },
+        }
+    }
+
     #[test]
     fn extract_value_by_source() {
         let headers = vec![("X-Token".to_string(), "H1".to_string())];
         let body = r#"{"id":42,"name":"bob"}"#;
-        // json
-        assert_eq!(
-            extract_value(&ExtractRule { name: "id".into(), from: "json".into(), expr: "id".into() }, Some(body), &[]),
-            Some("42".to_string())
-        );
+        assert_eq!(extract_value(&pe("json", "id"), Some(body), &[]), Some("42".to_string()));
         // header (case-insensitive)
-        assert_eq!(
-            extract_value(&ExtractRule { name: "t".into(), from: "header".into(), expr: "x-token".into() }, None, &headers),
-            Some("H1".to_string())
-        );
+        assert_eq!(extract_value(&pe("header", "x-token"), None, &headers), Some("H1".to_string()));
         // regex capture group 1
         assert_eq!(
-            extract_value(&ExtractRule { name: "n".into(), from: "regex".into(), expr: r#""name":"(\w+)""#.into() }, Some(body), &[]),
+            extract_value(&pe("regex", r#""name":"(\w+)""#), Some(body), &[]),
             Some("bob".to_string())
         );
     }
@@ -658,21 +660,20 @@ mod tests {
     #[test]
     fn extract_value_edge_cases() {
         let body = r#"{"data":{"deep":null},"n":7}"#;
-        let rule = |from: &str, expr: &str| ExtractRule { name: "x".into(), from: from.into(), expr: expr.into() };
         // missing json path → None (var stays unset, later steps keep the literal)
-        assert_eq!(extract_value(&rule("json", "data.nope"), Some(body), &[]), None);
+        assert_eq!(extract_value(&pe("json", "data.nope"), Some(body), &[]), None);
         // null json value → empty string (set but empty)
-        assert_eq!(extract_value(&rule("json", "data.deep"), Some(body), &[]), Some(String::new()));
+        assert_eq!(extract_value(&pe("json", "data.deep"), Some(body), &[]), Some(String::new()));
         // body absent → None
-        assert_eq!(extract_value(&rule("json", "n"), None, &[]), None);
+        assert_eq!(extract_value(&pe("json", "n"), None, &[]), None);
         // body not JSON → None
-        assert_eq!(extract_value(&rule("json", "n"), Some("<html>"), &[]), None);
-        // invalid regex → None, never a panic
-        assert_eq!(extract_value(&rule("regex", "([unclosed"), Some(body), &[]), None);
+        assert_eq!(extract_value(&pe("json", "n"), Some("<html>"), &[]), None);
+        // invalid regex → None (compiled to None up front), never a panic
+        assert_eq!(extract_value(&pe("regex", "([unclosed"), Some(body), &[]), None);
         // regex with no capture group falls back to the whole match
-        assert_eq!(extract_value(&rule("regex", r#"\d+"#), Some(body), &[]), Some("7".to_string()));
+        assert_eq!(extract_value(&pe("regex", r#"\d+"#), Some(body), &[]), Some("7".to_string()));
         // header missing → None
-        assert_eq!(extract_value(&rule("header", "X-None"), None, &[]), None);
+        assert_eq!(extract_value(&pe("header", "X-None"), None, &[]), None);
     }
 
     #[test]
