@@ -21,3 +21,9 @@ testdata/certs/*
 
 # Портативная сборка (бинарник, не в репозиторий)
 portable/
+
+# Внутренние доки и рабочие эпики — НЕ публиковать
+CONTEXT.md
+REVIEW_NOTES.md
+maelstrom-epic*.txt
+maelstrom-rollout-epic*.txt
