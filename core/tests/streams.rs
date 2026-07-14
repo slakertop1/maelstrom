@@ -63,7 +63,7 @@ async fn spawn_mock() -> (String, Arc<MockState>) {
                         .skip(1)
                         .take_while(|l| !l.is_empty())
                         .find(|l| l.to_ascii_lowercase().starts_with(&format!("{name}:")))
-                        .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string())
+                        .map(|l| l.split_once(':').map_or("", |(_, v)| v).trim().to_string())
                 };
 
                 let mut extra_headers = String::new();
