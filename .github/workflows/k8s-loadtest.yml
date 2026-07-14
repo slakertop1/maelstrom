@@ -1,0 +1,90 @@
+# Free, self-contained demo of "the CLI runs as a Kubernetes Job and load-tests
+# a service, gating the pipeline on thresholds" — no GitLab, no cloud cluster,
+# no card. It stands up a real single-node Kubernetes (kind) inside the runner,
+# builds the CLI image from THIS commit (so the latest engine, incl. request
+# chaining, is exercised), deploys a small stateful service, then applies the CLI
+# Job with a chained scenario (login → extract token → use it) and a health
+# stream. The Job's exit code becomes the pipeline verdict.
+name: k8s load test (kind)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/k8s-loadtest.yml"
+      - "deploy/k8s-demo/**"
+      - "Dockerfile"
+      - "core/**"
+      - "cli/**"
+
+jobs:
+  k8s-loadtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CLI image from this commit
+        run: docker build -t maelstrom-cli:ci .
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install kind
+        run: |
+          curl -sSLo ./kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+          chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+
+      - name: Create single-node Kubernetes (kind)
+        run: kind create cluster --name maelstrom --wait 120s
+
+      - name: Load the CLI image into the cluster
+        run: kind load docker-image maelstrom-cli:ci --name maelstrom
+
+      - name: Deploy the service under load
+        run: |
+          kubectl apply -f deploy/k8s-demo/mock.yaml
+          kubectl rollout status deploy/mock --timeout=120s
+
+      - name: Run the load test as a Kubernetes Job & gate
+        run: |
+          kubectl create configmap scenario \
+            --from-file=scenario.json=deploy/k8s-demo/scenario.json
+          kubectl apply -f deploy/k8s-demo/loadtest-job.yaml
+
+          echo "Waiting for the load-test Job to finish…"
+          status=""
+          end=$((SECONDS + 240))
+          while [ $SECONDS -lt $end ]; do
+            if [ "$(kubectl get job maelstrom-loadtest -o jsonpath='{.status.succeeded}')" = "1" ]; then
+              status=succeeded; break
+            fi
+            failed=$(kubectl get job maelstrom-loadtest -o jsonpath='{.status.failed}')
+            if [ -n "$failed" ] && [ "$failed" -ge 1 ]; then
+              status=failed; break
+            fi
+            sleep 3
+          done
+          echo "Job status: ${status:-timeout}"
+
+          echo "==================== CLI OUTPUT ===================="
+          kubectl logs job/maelstrom-loadtest | tee loadtest-output.txt
+          echo "==================================================="
+
+          # Green only when the CLI passed its gates (Job succeeded → exit 0).
+          test "$status" = "succeeded"
+
+      - name: Upload load-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-loadtest-output
+          path: loadtest-output.txt
+          if-no-files-found: warn
+
+      - name: Diagnostics (on failure)
+        if: failure()
+        run: |
+          echo "===== pods ====="; kubectl get pods -A -o wide || true
+          echo "===== job ====="; kubectl describe job maelstrom-loadtest || true
+          echo "===== mock deploy ====="; kubectl describe deploy mock || true
+          echo "===== mock logs ====="; kubectl logs deploy/mock --tail=50 || true

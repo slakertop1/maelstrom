@@ -1,0 +1,33 @@
+{
+  "name": "k8s-chain-demo",
+  "duration_secs": 15,
+  "timeout_ms": 5000,
+  "streams": [
+    {
+      "name": "checkout",
+      "rps": 40,
+      "steps": [
+        {
+          "name": "login",
+          "method": "POST",
+          "url": "http://mock:8080/login",
+          "extract": [{ "name": "token", "from": "json", "expr": "data.token" }]
+        },
+        {
+          "name": "order",
+          "method": "GET",
+          "url": "http://mock:8080/order",
+          "headers": [["Authorization", "Bearer {{token}}"]]
+        }
+      ]
+    },
+    {
+      "name": "health",
+      "rps": 20,
+      "steps": [
+        { "name": "health", "method": "GET", "url": "http://mock:8080/health" }
+      ]
+    }
+  ],
+  "thresholds": { "max_error_rate": 1.0, "max_p95_ms": 1500, "min_success_rate": 99.0 }
+}

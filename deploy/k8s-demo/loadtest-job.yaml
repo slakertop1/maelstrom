@@ -1,0 +1,34 @@
+# The Maelstrom CLI, deployed as a Kubernetes Job, load-tests the in-cluster
+# `mock` service with a request-chaining scenario and gates on thresholds:
+# the CLI exits non-zero when a gate is breached → the Job fails → the pipeline
+# goes red. Image and gates are overridable via the pipeline.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: maelstrom-loadtest
+spec:
+  backoffLimit: 0 # a gate breach must fail the run once, not retry
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: cli
+          image: maelstrom-cli:ci # loaded into kind by the workflow
+          imagePullPolicy: IfNotPresent
+          # ENTRYPOINT is `maelstrom`; override to also echo the JSON report into
+          # the logs while preserving the CLI's exit code for the gate.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              maelstrom /work/scenario.json --out-json /tmp/report.json \
+                --max-error-rate 1 --max-p95 1500 --min-success-rate 99
+              code=$?
+              echo "===== report.json ====="
+              cat /tmp/report.json 2>/dev/null || echo "(no report written)"
+              exit $code
+          volumeMounts:
+            - { name: scenario, mountPath: /work }
+      volumes:
+        - name: scenario
+          configMap: { name: scenario } # created from deploy/k8s-demo/scenario.json
