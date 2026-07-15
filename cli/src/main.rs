@@ -126,6 +126,11 @@ struct GrpcCliConfig {
     method: String,
     #[serde(default)]
     body: String,
+    /// Custom CA / mTLS client identity for `https://` endpoints — see the
+    /// HTTP path's `ScenarioTarget::tls` (maelstrom_core::types::TlsConfig).
+    /// Absent = as before: native root CAs only, no client identity.
+    #[serde(default)]
+    tls: Option<maelstrom_core::types::TlsConfig>,
     #[serde(default = "default_vus")]
     vus: usize,
     #[serde(default)]
@@ -162,6 +167,25 @@ fn below(value: f64, min: Option<f64>) -> bool {
         Some(m) => value.is_nan() || value < m,
         None => false,
     }
+}
+
+/// A threshold can't be confirmed against an empty sample: 0 requests makes
+/// `error_rate` read as a trivial 0.0 (see `histogram.rs`: `if total > 0 {...}
+/// else { 0.0 }`), and 0 chain iterations makes a stream's `success_rate` read
+/// as 0.0 too (see `streams.rs`) — either would silently satisfy (or, for a
+/// lax floor, "pass") any gate, even though nothing was actually measured.
+/// When a threshold is set and the run executed zero requests/iterations,
+/// that must be a gate failure, not a silent green light — you can't prove a
+/// threshold holds with zero data points.
+const ZERO_SAMPLE_MSG: &str = "0 запросов выполнено — порог не может быть подтверждён";
+
+/// True when at least one threshold is set but the run executed zero
+/// requests/iterations — the exact condition that must fail the gate instead
+/// of silently passing (see `ZERO_SAMPLE_MSG`). Deliberately ignores the
+/// threshold's *value*: even a maximally lax threshold (e.g. `max_error_rate:
+/// 100` or `min_success_rate: 0`) can't be confirmed against zero data.
+fn zero_sample_breach(executed: u64, any_threshold_set: bool) -> bool {
+    any_threshold_set && executed == 0
 }
 
 #[derive(Deserialize, Default)]
@@ -467,20 +491,27 @@ async fn main() -> ExitCode {
         );
     }
     let mut failed = false;
-    if let Some(me) = max_err {
-        if breached(o.error_rate, Some(me)) {
-            log!("ГЕЙТ", "✖ доля ошибок {:.2}% > {:.2}%", o.error_rate, me);
-            failed = true;
-        } else {
-            log!("ГЕЙТ", "✓ доля ошибок {:.2}% ≤ {:.2}%", o.error_rate, me);
+    if zero_sample_breach(o.total_requests, max_err.is_some() || max_p95.is_some()) {
+        // 0 requests total -> error_rate is a trivial 0.0, which would pass
+        // any max_error_rate/max_p95 gate silently. Fail loudly instead.
+        log!("ГЕЙТ", "✖ {}", ZERO_SAMPLE_MSG);
+        failed = true;
+    } else {
+        if let Some(me) = max_err {
+            if breached(o.error_rate, Some(me)) {
+                log!("ГЕЙТ", "✖ доля ошибок {:.2}% > {:.2}%", o.error_rate, me);
+                failed = true;
+            } else {
+                log!("ГЕЙТ", "✓ доля ошибок {:.2}% ≤ {:.2}%", o.error_rate, me);
+            }
         }
-    }
-    if let Some(mp) = max_p95 {
-        if breached(o.p95_ms, Some(mp)) {
-            log!("ГЕЙТ", "✖ p95 {:.0}мс > {:.0}мс", o.p95_ms, mp);
-            failed = true;
-        } else {
-            log!("ГЕЙТ", "✓ p95 {:.0}мс ≤ {:.0}мс", o.p95_ms, mp);
+        if let Some(mp) = max_p95 {
+            if breached(o.p95_ms, Some(mp)) {
+                log!("ГЕЙТ", "✖ p95 {:.0}мс > {:.0}мс", o.p95_ms, mp);
+                failed = true;
+            } else {
+                log!("ГЕЙТ", "✓ p95 {:.0}мс ≤ {:.0}мс", o.p95_ms, mp);
+            }
         }
     }
     if failed {
@@ -672,25 +703,39 @@ async fn run_streams_load(
     let max_p95 = args.max_p95.or(t.and_then(|t| t.max_p95_ms));
     let min_sr = args.min_success_rate.or(t.and_then(|t| t.min_success_rate));
     let mut failed = false;
-    if let Some(me) = max_err {
-        if breached(o.error_rate, Some(me)) {
-            log("ГЕЙТ", format!("✖ доля ошибок {:.2}% > {:.2}%", o.error_rate, me));
-            failed = true;
-        } else {
-            log("ГЕЙТ", format!("✓ доля ошибок {:.2}% ≤ {:.2}%", o.error_rate, me));
+    if zero_sample_breach(o.total_requests, max_err.is_some() || max_p95.is_some()) {
+        // Same empty-sample guard as the HTTP path: 0 requests overall makes
+        // error_rate a trivial 0.0, which would pass any max_* gate silently.
+        log("ГЕЙТ", format!("✖ {}", ZERO_SAMPLE_MSG));
+        failed = true;
+    } else {
+        if let Some(me) = max_err {
+            if breached(o.error_rate, Some(me)) {
+                log("ГЕЙТ", format!("✖ доля ошибок {:.2}% > {:.2}%", o.error_rate, me));
+                failed = true;
+            } else {
+                log("ГЕЙТ", format!("✓ доля ошибок {:.2}% ≤ {:.2}%", o.error_rate, me));
+            }
         }
-    }
-    if let Some(mp) = max_p95 {
-        if breached(o.p95_ms, Some(mp)) {
-            log("ГЕЙТ", format!("✖ p95 {:.0}мс > {:.0}мс", o.p95_ms, mp));
-            failed = true;
-        } else {
-            log("ГЕЙТ", format!("✓ p95 {:.0}мс ≤ {:.0}мс", o.p95_ms, mp));
+        if let Some(mp) = max_p95 {
+            if breached(o.p95_ms, Some(mp)) {
+                log("ГЕЙТ", format!("✖ p95 {:.0}мс > {:.0}мс", o.p95_ms, mp));
+                failed = true;
+            } else {
+                log("ГЕЙТ", format!("✓ p95 {:.0}мс ≤ {:.0}мс", o.p95_ms, mp));
+            }
         }
     }
     if let Some(ms) = min_sr {
         for s in &result.streams {
-            if below(s.success_rate, Some(ms)) {
+            if zero_sample_breach(s.iterations_started, true) {
+                // Zero chain attempts for this stream -> success_rate reads as
+                // a trivial 0.0 (see streams.rs), which a lax floor (even 0)
+                // would otherwise pass. Zero iterations can't confirm any
+                // floor, no matter its value.
+                log("ГЕЙТ", format!("✖ поток «{}»: {}", s.name, ZERO_SAMPLE_MSG));
+                failed = true;
+            } else if below(s.success_rate, Some(ms)) {
                 log(
                     "ГЕЙТ",
                     format!("✖ поток «{}»: завершено {:.1}% < {:.1}%", s.name, s.success_rate, ms),
@@ -733,7 +778,7 @@ async fn run_grpc_load(
             return ExitCode::from(2);
         }
     };
-    let call = match proto.build_call(&g.endpoint, &g.service, &g.method, &g.body, g.timeout_ms) {
+    let call = match proto.build_call_with_tls(&g.endpoint, &g.service, &g.method, &g.body, g.timeout_ms, g.tls.clone()) {
         Ok(c) => c,
         Err(e) => {
             log("CLI", format!("gRPC вызов: {e}"));
@@ -851,20 +896,27 @@ fn finish_load(
         );
     }
     let mut failed = false;
-    if let Some(me) = max_err {
-        if breached(result.error_rate, Some(me)) {
-            log("ГЕЙТ", format!("✖ доля ошибок {:.2}% > {:.2}%", result.error_rate, me));
-            failed = true;
-        } else {
-            log("ГЕЙТ", format!("✓ доля ошибок {:.2}% ≤ {:.2}%", result.error_rate, me));
+    if zero_sample_breach(result.total_requests, max_err.is_some() || max_p95.is_some()) {
+        // Same empty-sample guard as the HTTP path: 0 requests makes
+        // error_rate a trivial 0.0, which would pass any max_* gate silently.
+        log("ГЕЙТ", format!("✖ {}", ZERO_SAMPLE_MSG));
+        failed = true;
+    } else {
+        if let Some(me) = max_err {
+            if breached(result.error_rate, Some(me)) {
+                log("ГЕЙТ", format!("✖ доля ошибок {:.2}% > {:.2}%", result.error_rate, me));
+                failed = true;
+            } else {
+                log("ГЕЙТ", format!("✓ доля ошибок {:.2}% ≤ {:.2}%", result.error_rate, me));
+            }
         }
-    }
-    if let Some(mp) = max_p95 {
-        if breached(result.p95_ms, Some(mp)) {
-            log("ГЕЙТ", format!("✖ p95 {:.0}мс > {:.0}мс", result.p95_ms, mp));
-            failed = true;
-        } else {
-            log("ГЕЙТ", format!("✓ p95 {:.0}мс ≤ {:.0}мс", result.p95_ms, mp));
+        if let Some(mp) = max_p95 {
+            if breached(result.p95_ms, Some(mp)) {
+                log("ГЕЙТ", format!("✖ p95 {:.0}мс > {:.0}мс", result.p95_ms, mp));
+                failed = true;
+            } else {
+                log("ГЕЙТ", format!("✓ p95 {:.0}мс ≤ {:.0}мс", result.p95_ms, mp));
+            }
         }
     }
     if failed {
@@ -896,7 +948,7 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{below, breached, expand_env};
+    use super::{below, breached, expand_env, zero_sample_breach};
 
     #[test]
     fn threshold_gate() {
@@ -1015,5 +1067,21 @@ mod tests {
         assert!(below(98.9, Some(99.0)));
         assert!(!below(99.0, Some(99.0)));
         assert!(!below(100.0, Some(99.0)));
+    }
+
+    #[test]
+    fn zero_sample_gate() {
+        // c1-deeper: a run that executed 0 requests/iterations must breach
+        // the gate whenever a threshold was actually set — 0/0 reads as a
+        // trivial error_rate/success_rate of 0.0 (see histogram.rs /
+        // streams.rs), which `breached`/`below` alone would treat as a pass.
+        assert!(zero_sample_breach(0, true));
+        // Any nonzero sample is never a zero-sample breach, no matter how
+        // small — the normal breached()/below() value checks take over.
+        assert!(!zero_sample_breach(1, true));
+        assert!(!zero_sample_breach(1_000, true));
+        // No threshold set at all -> nothing to confirm, so 0 executed is
+        // fine (matches how breached()/below() treat `None`).
+        assert!(!zero_sample_breach(0, false));
     }
 }

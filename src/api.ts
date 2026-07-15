@@ -92,6 +92,7 @@ export async function grpcCall(spec: {
   method: string;
   body: string;
   timeout_ms?: number;
+  tls?: TlsSpec | null;
 }): Promise<GrpcCallResult> {
   return invoke<GrpcCallResult>("grpc_call", { spec });
 }
@@ -107,6 +108,7 @@ export async function grpcStartLoad(spec: {
   duration_secs: number;
   rps_limit: number | null;
   timeout_ms: number;
+  tls?: TlsSpec | null;
 }): Promise<void> {
   return invoke("grpc_start_load", { spec });
 }

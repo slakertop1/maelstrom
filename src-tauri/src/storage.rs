@@ -24,6 +24,48 @@ fn restrict_perms(_path: &Path) {
     // an open one). Out of scope for this point fix.
 }
 
+/// Create the temp file with owner-only permissions baked into the `open()`
+/// call itself, so there is no window between file creation and chmod during
+/// which a world/group-readable file with secrets (tokens, passwords, AWS
+/// creds saved in requests) sits on disk.
+///
+/// `mode` is only honored by the kernel when `open()` actually creates a
+/// fresh inode. `create(true)` without `O_EXCL` happily reopens/truncates a
+/// file that already exists at this deterministic path (left over from a
+/// prior crash between create and chmod, or planted by another local user
+/// with write access to the directory) *without* ever applying `mode` to
+/// it — so a stale wide-open file would silently receive the new secrets
+/// while keeping its old permissions until the later `restrict_perms`
+/// call. Use `create_new` (which forces `O_EXCL`) so `mode` is only ever
+/// applied to a brand-new inode; if a stale file is in the way, remove it
+/// and retry once so we still end up with a fresh 0600 file.
+#[cfg(unix)]
+fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fn open_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    match open_fresh(path) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            open_fresh(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(windows)]
+fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
+    // TODO: same ACL gap as restrict_perms above — no atomic owner-only
+    // create on Windows via std, so this still opens with default perms.
+    std::fs::File::create(path)
+}
+
 /// Atomically replace `file` with `data`: write a temp file, fsync it so the
 /// bytes are actually on disk, keep the previous version as `.bak`, then
 /// rename over the target. A crash mid-write (or a power loss right after)
@@ -31,10 +73,14 @@ fn restrict_perms(_path: &Path) {
 fn write_atomic(file: &Path, data: &str) -> Result<(), String> {
     let tmp = file.with_extension("json.tmp");
     {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let mut f = create_tmp_file(&tmp).map_err(|e| e.to_string())?;
         f.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
     }
+    // Belt-and-suspenders: on unix the file is already 0600 from the moment
+    // it was created (no world/group-readable window), so this just forces
+    // the exact mode regardless of umask; on Windows it remains the (currently
+    // no-op) ACL TODO above.
     restrict_perms(&tmp);
     if file.exists() {
         let bak = file.with_extension("json.bak");
@@ -151,6 +197,73 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(bak_mode, 0o600, "state.json.bak must not be group/world readable");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// p1-TOCTOU regression test: the temp file must be born with 0600 — not
+    /// created world/group-readable and chmod'd afterward, which would leave
+    /// a window where secrets (tokens, passwords, AWS creds saved in
+    /// requests) are readable by other local users. Checking the mode right
+    /// after `create_tmp_file` returns, before any chmod call ever runs,
+    /// proves there is no such window: permissions are set atomically by the
+    /// `open()` call itself via `OpenOptionsExt::mode`.
+    #[cfg(unix)]
+    #[test]
+    fn create_tmp_file_is_born_owner_only_with_no_toctou_window() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("maelstrom-test-toctou-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("state.json.tmp");
+
+        let f = create_tmp_file(&tmp).unwrap();
+        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "temp file must be 0600 immediately on creation, before any later chmod"
+        );
+        drop(f);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// p1-TOCTOU regression, round 2: a stale/planted tmp file already
+    /// sitting at the deterministic path (leftover from a prior crash
+    /// between create and chmod, or planted by another local user with
+    /// write access to the directory) must not be silently reused.
+    /// `create(true)` without `O_EXCL` would reopen/truncate that existing
+    /// inode without ever applying `mode`, so the new secrets would land
+    /// in a file that keeps its old, possibly world/group-readable,
+    /// permissions. Assert the file `create_tmp_file` hands back is a
+    /// fresh, empty, strictly-0600 inode even when a wide-open file with
+    /// content already existed at that path.
+    #[cfg(unix)]
+    #[test]
+    fn create_tmp_file_replaces_preexisting_world_readable_file_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("maelstrom-test-stale-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("state.json.tmp");
+
+        // Simulate a stale/planted tmp file with wide-open permissions and
+        // leftover content from a previous (interrupted) write.
+        std::fs::write(&tmp, b"leftover-secret").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let f = create_tmp_file(&tmp).unwrap();
+        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "pre-existing tmp file must be replaced with a fresh 0600 inode, not reused"
+        );
+        assert_eq!(
+            f.metadata().unwrap().len(),
+            0,
+            "pre-existing tmp file must be a fresh empty inode, not a reused/truncated one"
+        );
+        drop(f);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

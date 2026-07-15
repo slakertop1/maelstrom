@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub enum PickMode {
     Sequential,
@@ -278,14 +279,25 @@ fn pick_mode(mode: &str) -> PickMode {
 
 /// Resolve dataset and file-pool specs into an in-memory DynState (reads files /
 /// fetches URLs once, up front). DB-backed datasets are resolved by the caller
-/// into inline rows before this is called.
-pub async fn resolve(specs: &[DatasetSpec], pools: &[FilePoolSpec]) -> Result<DynState, String> {
+/// into inline rows before this is called. `cancel` lets a Stop hit during a
+/// slow/large load abort the wait instead of blocking it until the 10s/300s
+/// transport timeouts (or a blocking fs call) finish on their own — see the
+/// per-source notes on `load_rows`/`load_pool`/`fetch_signed` for exactly where
+/// cancellation is (and, for single blocking fs calls, isn't) checked.
+pub async fn resolve(
+    specs: &[DatasetSpec],
+    pools: &[FilePoolSpec],
+    cancel: &CancellationToken,
+) -> Result<DynState, String> {
     let mut datasets = HashMap::new();
     for spec in specs {
         if spec.name.trim().is_empty() {
             continue;
         }
-        let rows = load_rows(spec).await?;
+        if cancel.is_cancelled() {
+            return Err("Загрузка данных отменена".to_string());
+        }
+        let rows = load_rows(spec, cancel).await?;
         datasets.insert(
             spec.name.clone(),
             Dataset { mode: pick_mode(&spec.mode), rows, cursor: AtomicUsize::new(0) },
@@ -296,7 +308,10 @@ pub async fn resolve(specs: &[DatasetSpec], pools: &[FilePoolSpec]) -> Result<Dy
         if spec.name.trim().is_empty() {
             continue;
         }
-        let files = load_pool(spec).await?;
+        if cancel.is_cancelled() {
+            return Err("Загрузка данных отменена".to_string());
+        }
+        let files = load_pool(spec, cancel).await?;
         if files.is_empty() {
             return Err(format!("Набор файлов «{}»: не найдено ни одного файла", spec.name));
         }
@@ -308,24 +323,42 @@ pub async fn resolve(specs: &[DatasetSpec], pools: &[FilePoolSpec]) -> Result<Dy
     Ok(DynState { counter: AtomicU64::new(0), datasets, file_pools })
 }
 
+/// A `fetch_signed` failure: either the transport itself errored, or `cancel`
+/// fired while the request was in flight. Kept separate from `reqwest::Error`
+/// (which has no "cancelled" variant of its own) so callers can render a
+/// dedicated message instead of a misleading transport-error string.
+enum FetchErr {
+    Cancelled,
+    Http(reqwest::Error),
+}
+
 /// GET a URL, optionally signing it with AWS Signature V4 (for a private S3
 /// object). Without creds it is a plain GET — a public object or a presigned
 /// link, as before. The client sets `Host` to match what the signer signed.
+/// Races the request against `cancel` so a Stop hit while connecting/sending
+/// returns promptly instead of waiting out the 10s connect timeout. Note this
+/// only covers `req.send()`, which reqwest resolves as soon as the response
+/// *headers* arrive — it does NOT race the body. Callers that go on to read
+/// the body (`resp.bytes()`/`resp.text()`) must race that read against
+/// `cancel` themselves (see the "url" branches of `load_rows`/`load_pool`
+/// below) so a Stop hit mid-download doesn't sit out the 300s overall
+/// timeout.
 async fn fetch_signed(
     url: &str,
     aws: Option<&crate::types::AwsAuth>,
-) -> Result<reqwest::Response, reqwest::Error> {
+    cancel: &CancellationToken,
+) -> Result<reqwest::Response, FetchErr> {
     // Bounded, unlike `Client::new()` — a dataset/pool URL that never answers
     // (or a TCP handshake that never completes) used to hang the whole run's
     // start-up forever. `connect_timeout` fails fast on an unreachable host,
     // while the overall `timeout` is generous (5 min) so a legitimately large
-    // dataset over a slow link still downloads. Full cancellation plumbing
-    // through resolve/load_rows/load_pool is a separate follow-up (d1b) since it
-    // would ripple their signatures outside this file.
+    // dataset over a slow link still downloads — `cancel` below is what lets
+    // Stop pre-empt that 5-minute cap instead of waiting for it.
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
-        .build()?;
+        .build()
+        .map_err(FetchErr::Http)?;
     let mut req = client.get(url);
     if let Some(a) = aws {
         if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -334,7 +367,10 @@ async fn fetch_signed(
             }
         }
     }
-    req.send().await
+    tokio::select! {
+        _ = cancel.cancelled() => Err(FetchErr::Cancelled),
+        r = req.send() => r.map_err(FetchErr::Http),
+    }
 }
 
 /// Cap on files loaded per pool — a guard against picking a huge directory and
@@ -359,10 +395,11 @@ fn prepared_from_bytes(bytes: Vec<u8>, name_hint: &str) -> PreparedFile {
     PreparedFile { bytes: bytes::Bytes::from(bytes), filename, mime }
 }
 
-async fn load_pool(spec: &FilePoolSpec) -> Result<Vec<PreparedFile>, String> {
+async fn load_pool(spec: &FilePoolSpec, cancel: &CancellationToken) -> Result<Vec<PreparedFile>, String> {
     let src = &spec.source;
     let mut out = Vec::new();
     let err = |e: String| format!("Набор файлов «{}»: {e}", spec.name);
+    let cancelled = || err("отменено".into());
     match src.kind.as_str() {
         "folder" => {
             let dir = src.path.as_deref().unwrap_or("").trim();
@@ -370,6 +407,12 @@ async fn load_pool(spec: &FilePoolSpec) -> Result<Vec<PreparedFile>, String> {
                 return Err(err("не указана папка".into()));
             }
             let mask = src.mask.as_deref().unwrap_or("");
+            // A directory listing is a single blocking syscall that, once
+            // started, cannot be interrupted mid-flight — `cancel` is only
+            // checked before it starts and between the per-file reads below.
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
             let entries =
                 std::fs::read_dir(dir).map_err(|e| err(format!("не читается папка {dir}: {e}")))?;
             let mut paths: Vec<std::path::PathBuf> = entries
@@ -384,6 +427,12 @@ async fn load_pool(spec: &FilePoolSpec) -> Result<Vec<PreparedFile>, String> {
                 .collect();
             paths.sort();
             for path in paths.into_iter().take(MAX_POOL_FILES) {
+                if cancel.is_cancelled() {
+                    return Err(cancelled());
+                }
+                // Same caveat as above: `std::fs::read` of one file cannot be
+                // interrupted once it starts — only the gap between files is
+                // cancellable.
                 let bytes = std::fs::read(&path)
                     .map_err(|e| err(format!("не читается {}: {e}", path.display())))?;
                 out.push(prepared_from_bytes(bytes, &path.to_string_lossy()));
@@ -391,10 +440,15 @@ async fn load_pool(spec: &FilePoolSpec) -> Result<Vec<PreparedFile>, String> {
         }
         "list" => {
             for path in src.paths.clone().unwrap_or_default().into_iter().take(MAX_POOL_FILES) {
+                if cancel.is_cancelled() {
+                    return Err(cancelled());
+                }
                 let path = path.trim();
                 if path.is_empty() {
                     continue;
                 }
+                // See the "folder" branch above: a single blocking read can't
+                // be interrupted mid-flight, only between files.
                 let bytes = std::fs::read(path)
                     .map_err(|e| err(format!("не читается {path}: {e}")))?;
                 out.push(prepared_from_bytes(bytes, path));
@@ -408,16 +462,21 @@ async fn load_pool(spec: &FilePoolSpec) -> Result<Vec<PreparedFile>, String> {
                 }
                 // Redact the URL in errors — presigned S3 links carry a signature.
                 let safe = crate::redact::safe_url(url);
-                let resp = fetch_signed(url, spec.source.aws.as_ref())
+                let resp = fetch_signed(url, spec.source.aws.as_ref(), cancel)
                     .await
                     .map_err(|e| err(format!("{safe} — {}", transport_reason(&e))))?;
                 if !resp.status().is_success() {
                     return Err(err(format!("{safe}: HTTP {}", resp.status().as_u16())));
                 }
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| err(format!("{safe} — {}", transport_reason(&e))))?;
+                // `resp` only means the headers arrived — race the body read
+                // against `cancel` too, or a Stop hit mid-download would sit
+                // out the 300s overall timeout (see fetch_signed's doc).
+                let bytes = tokio::select! {
+                    _ = cancel.cancelled() => return Err(cancelled()),
+                    r = resp.bytes() => {
+                        r.map_err(|e| err(format!("{safe} — {}", transport_reason(&FetchErr::Http(e)))))?
+                    }
+                };
                 // Strip any query string when guessing the name/extension.
                 let name = url.split(['?', '#']).next().unwrap_or(url);
                 out.push(prepared_from_bytes(bytes.to_vec(), name));
@@ -430,23 +489,24 @@ async fn load_pool(spec: &FilePoolSpec) -> Result<Vec<PreparedFile>, String> {
 
 /// Coarse, secret-free reason for a failed HTTP fetch. reqwest's own Display
 /// embeds the full (possibly presigned) URL, so we never surface it directly.
-fn transport_reason(e: &reqwest::Error) -> &'static str {
-    if e.is_timeout() {
-        "таймаут"
-    } else if e.is_connect() {
-        "ошибка соединения (DNS/TLS/отказ)"
-    } else if e.is_body() || e.is_decode() {
-        "ошибка чтения ответа"
-    } else {
-        "ошибка запроса"
+fn transport_reason(e: &FetchErr) -> &'static str {
+    match e {
+        FetchErr::Cancelled => "отменено",
+        FetchErr::Http(e) if e.is_timeout() => "таймаут",
+        FetchErr::Http(e) if e.is_connect() => "ошибка соединения (DNS/TLS/отказ)",
+        FetchErr::Http(e) if e.is_body() || e.is_decode() => "ошибка чтения ответа",
+        FetchErr::Http(_) => "ошибка запроса",
     }
 }
 
-fn fetch_error(name: &str, url: &str, e: &reqwest::Error) -> String {
+fn fetch_error(name: &str, url: &str, e: &FetchErr) -> String {
     format!("Датасет «{name}»: {} — {}", crate::redact::safe_url(url), transport_reason(e))
 }
 
-async fn load_rows(spec: &DatasetSpec) -> Result<Vec<HashMap<String, String>>, String> {
+async fn load_rows(
+    spec: &DatasetSpec,
+    cancel: &CancellationToken,
+) -> Result<Vec<HashMap<String, String>>, String> {
     let src = &spec.source;
     match src.kind.as_str() {
         "inline" => Ok(src.rows.clone().unwrap_or_default()),
@@ -455,6 +515,12 @@ async fn load_rows(spec: &DatasetSpec) -> Result<Vec<HashMap<String, String>>, S
             if path.is_empty() {
                 return Err(format!("Датасет «{}»: не указан путь к файлу", spec.name));
             }
+            if cancel.is_cancelled() {
+                return Err(format!("Датасет «{}»: отменено", spec.name));
+            }
+            // A single std::fs::read_to_string is one blocking syscall that
+            // can't be interrupted mid-flight — cancellation is only checked
+            // before it starts (above).
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("Датасет «{}»: {e}", spec.name))?;
             parse_rows(&text, src.format.as_deref(), path)
@@ -466,7 +532,7 @@ async fn load_rows(spec: &DatasetSpec) -> Result<Vec<HashMap<String, String>>, S
             }
             // Never echo the raw URL (may be a presigned S3 link with a signature)
             // or reqwest's Display (which embeds it) — redact + coarse reason.
-            let resp = fetch_signed(url, src.aws.as_ref())
+            let resp = fetch_signed(url, src.aws.as_ref(), cancel)
                 .await
                 .map_err(|e| fetch_error(&spec.name, url, &e))?;
             // A private S3 GET that isn't authorised returns an XML error *body*
@@ -480,7 +546,13 @@ async fn load_rows(spec: &DatasetSpec) -> Result<Vec<HashMap<String, String>>, S
                     resp.status().as_u16()
                 ));
             }
-            let text = resp.text().await.map_err(|e| fetch_error(&spec.name, url, &e))?;
+            // `resp` only means the headers arrived — race the body read
+            // against `cancel` too, or a Stop hit mid-download would sit out
+            // the 300s overall timeout (see fetch_signed's doc).
+            let text = tokio::select! {
+                _ = cancel.cancelled() => return Err(fetch_error(&spec.name, url, &FetchErr::Cancelled)),
+                r = resp.text() => r.map_err(|e| fetch_error(&spec.name, url, &FetchErr::Http(e)))?,
+            };
             parse_rows(&text, src.format.as_deref(), url)
         }
         other => Err(format!("Датасет «{}»: неизвестный источник {other}", spec.name)),
@@ -729,6 +801,66 @@ mod tests {
         assert!(parse_json_rows(r#"{"a":1}"#).is_err());
     }
 
+    /// Regression: cancelling while the response *body* is still trickling in
+    /// (headers already received) used to be a no-op — `fetch_signed` only
+    /// raced `cancel` against `req.send()`, which reqwest resolves as soon as
+    /// headers arrive, so `load_rows`'s subsequent `resp.text().await` had no
+    /// race at all and would sit out the full 300s timeout. The server below
+    /// sends headers with a `Content-Length` promise it never fulfils, so a
+    /// non-cancelling read would hang for the whole 300s; bounding the test in
+    /// `tokio::time::timeout` at 5s proves cancellation — not the transport
+    /// timeout — is what unblocks it.
+    #[tokio::test]
+    async fn load_rows_url_cancel_during_body_read_returns_promptly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // drain the request
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                    .await;
+                // No body bytes follow — simulate a stalled/slow transfer and
+                // hold the socket open well past the test's own timeout.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
+        let spec = DatasetSpec {
+            name: "slow".into(),
+            mode: "sequential".into(),
+            source: DatasetSource {
+                kind: "url".into(),
+                rows: None,
+                path: None,
+                url: Some(format!("http://{addr}/data.csv")),
+                format: Some("csv".into()),
+                query: None,
+                aws: None,
+            },
+        };
+
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            // Give the header round-trip time to land before cancelling, so
+            // the race under test is against the body read, not the send.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel2.cancel();
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(5), load_rows(&spec, &cancel))
+            .await
+            .expect("cancel should make load_rows return well before the 300s transport timeout");
+        let err = result.unwrap_err();
+        assert!(err.contains("отменено"), "{err}");
+    }
+
     #[tokio::test]
     async fn resolve_inline_dataset() {
         let spec = DatasetSpec {
@@ -744,7 +876,9 @@ mod tests {
                 aws: None,
             },
         };
-        let state = resolve(std::slice::from_ref(&spec), &[]).await.unwrap();
+        let state = resolve(std::slice::from_ref(&spec), &[], &CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(state.request().expand("{{$data.u.id}}"), "1");
         assert_eq!(state.request().expand("{{$data.u.id}}"), "2");
     }
@@ -778,7 +912,9 @@ mod tests {
                 aws: None,
             },
         };
-        let state = resolve(&[], std::slice::from_ref(&spec)).await.unwrap();
+        let state = resolve(&[], std::slice::from_ref(&spec), &CancellationToken::new())
+            .await
+            .unwrap();
         // Only the two .png files are in the pool; sequential order is sorted.
         let r1 = state.request();
         let f1 = r1.pick_file("imgs").unwrap();

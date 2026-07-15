@@ -109,12 +109,15 @@ pub async fn fetch_token(spec: &OAuthTokenRequest) -> Result<OAuthTokenResponse,
 
 /// Fetch an initial token, then keep it fresh in the background until `cancel`
 /// fires. Refreshes at 80% of the token's TTL and invokes `on_refresh(count)`
-/// after each successful renewal. Returns the shared token cell that workers
-/// read on every request.
+/// after each successful renewal, or `on_error(message)` after each failed one
+/// (in addition to the `eprintln!` trace, since a packaged GUI build has no
+/// visible stderr — `on_error` is how the failure reaches the app's own log/UI).
+/// Returns the shared token cell that workers read on every request.
 pub async fn start_token_refresher(
     mut cfg: OAuthTokenRequest,
     cancel: CancellationToken,
     on_refresh: Arc<dyn Fn(u64) + Send + Sync>,
+    on_error: Arc<dyn Fn(String) + Send + Sync>,
 ) -> Result<Arc<RwLock<String>>, String> {
     let first = fetch_token(&cfg).await?;
     let value = Arc::new(RwLock::new(first.access_token));
@@ -165,9 +168,11 @@ pub async fn start_token_refresher(
                     // fetch_token's error text is already stripped of any
                     // raw response body (see post_token), so it's safe to
                     // log as-is.
-                    eprintln!(
+                    let msg = format!(
                         "[oauth] фоновое обновление токена не удалось, повтор через {fail_backoff}с: {e}"
                     );
+                    eprintln!("{msg}");
+                    on_error(msg);
                     ttl = fail_backoff;
                     fail_backoff = (fail_backoff * 2).min(300);
                 }

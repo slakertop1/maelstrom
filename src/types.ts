@@ -163,6 +163,11 @@ export interface GrpcConfig {
   body: string;
   /** Import root dirs (like protoc -I), one per line — for resolving imports. */
   import_paths: string;
+  /** Custom CA / mTLS client cert for the `https://` endpoint above. Reuses
+   * the same TlsEditor/TlsConfig shape as HTTP requests (see RequestConfig.tls) —
+   * gRPC keeps its own copy here because the gRPC tab has no access to the
+   * top-level request TLS tab (that tab is hidden for non-HTTP requests). */
+  tls: TlsConfig;
 }
 
 export interface GrpcMethodInfo {
@@ -695,6 +700,7 @@ export function newRequest(name = "New request"): RequestConfig {
       method: "",
       body: "",
       import_paths: "",
+      tls: newTls(),
     },
     ws: {
       url: "",
@@ -713,7 +719,11 @@ export function migrateRequest(r: any): RequestConfig {
     auth: migrateAuth(r?.auth),
     tls: { ...base.tls, ...(r?.tls ?? {}) },
     db: { ...base.db, ...(r?.db ?? {}) },
-    grpc: { ...base.grpc, ...(r?.grpc ?? {}) },
+    grpc: {
+      ...base.grpc,
+      ...(r?.grpc ?? {}),
+      tls: { ...base.grpc.tls, ...(r?.grpc?.tls ?? {}) },
+    },
     ws: { ...base.ws, ...(r?.ws ?? {}) },
     assertions: Array.isArray(r?.assertions) ? r.assertions : [],
     kind: r?.kind ?? "http",

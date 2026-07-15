@@ -45,6 +45,12 @@ pub struct GrpcCallSpec {
     pub method: String,
     pub body: String,
     pub timeout_ms: Option<u64>,
+    /// Custom CA / mTLS client identity for an `https://` endpoint — same
+    /// shape the HTTP engine uses (see `http_client::HttpRequestSpec::tls`).
+    /// Optional for backward compatibility: absent/`null` behaves exactly as
+    /// before (native root CAs only, no client identity).
+    #[serde(default)]
+    pub tls: Option<crate::tls::TlsConfig>,
 }
 
 #[derive(Serialize)]
@@ -64,12 +70,13 @@ pub async fn grpc_call(app: AppHandle, spec: GrpcCallSpec) -> Result<GrpcCallRes
         &format!("{} {}/{}", crate::log::safe_url(&spec.endpoint), spec.service, spec.method),
     );
     let res = proto
-        .call_json(
+        .call_json_with_tls(
             &spec.endpoint,
             &spec.service,
             &spec.method,
             &spec.body,
             spec.timeout_ms.unwrap_or(30_000),
+            spec.tls.clone(),
         )
         .await;
     match res {
@@ -104,6 +111,10 @@ pub struct GrpcLoadSpec {
     pub duration_secs: u64,
     pub rps_limit: Option<u32>,
     pub timeout_ms: u64,
+    /// Same TLS config as [`GrpcCallSpec::tls`] — optional, `None` behaves
+    /// exactly as before.
+    #[serde(default)]
+    pub tls: Option<crate::tls::TlsConfig>,
 }
 
 /// Run a gRPC load test using the shared load-test slot; emits `load_finished`.
@@ -115,12 +126,13 @@ pub async fn grpc_start_load(
 ) -> Result<(), String> {
     let proto = load_proto(&spec.proto)?;
     // Build the call up front so a bad proto/body/method fails fast (before the slot).
-    let call = proto.build_call(
+    let call = proto.build_call_with_tls(
         &spec.endpoint,
         &spec.service,
         &spec.method,
         &spec.body,
         spec.timeout_ms,
+        spec.tls.clone(),
     )?;
 
     let (token, running) = state.try_start()?;

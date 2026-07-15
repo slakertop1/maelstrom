@@ -116,7 +116,7 @@ pub async fn run_scenario(
         }
     }
     let dyn_state = Arc::new(
-        crate::dynval::resolve(&spec.datasets, &spec.file_pools)
+        crate::dynval::resolve(&spec.datasets, &spec.file_pools, &cancel)
             .await
             .map_err(&log_err)?,
     );
@@ -138,6 +138,15 @@ pub async fn run_scenario(
         }
     }
 
+    // Background refresh failures have no interactive caller to return an
+    // Err to — route them into the same `on_log` trace as everything else
+    // (prefixed like `log_err` does) so a refresh dying mid-run is visible
+    // in the engine log instead of only on stderr (r4).
+    let on_oauth_error: Arc<dyn Fn(String) + Send + Sync> = {
+        let on_log = on_log.clone();
+        Arc::new(move |msg| on_log(format!("✗ {msg}")))
+    };
+
     // Per-target auto-refreshing OAuth token (initial fetch now, fail fast).
     let mut live_tokens: Vec<Option<Arc<RwLock<String>>>> = Vec::with_capacity(spec.targets.len());
     for t in &spec.targets {
@@ -147,7 +156,12 @@ pub async fn run_scenario(
                 t.name,
                 crate::redact::safe_url(&cfg.token_url)
             ));
-            let cell = start_token_refresher(cfg, cancel.clone(), on_token_refresh.clone())
+            let cell = start_token_refresher(
+                cfg,
+                cancel.clone(),
+                on_token_refresh.clone(),
+                on_oauth_error.clone(),
+            )
                 .await
                 .map_err(|e| {
                     // Refreshers already started for earlier targets share this

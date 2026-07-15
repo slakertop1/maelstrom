@@ -98,7 +98,16 @@ pub async fn send_request(
     // dynamic generators ({{$uuid}}, …), file pools, AND datasets ({{$data.*}})
     // all work here too. DB-backed datasets are turned into inline rows first.
     let datasets = crate::db::resolve_db_datasets(&app, &spec.datasets).await?;
-    let dyn_state = maelstrom_core::dynval::resolve(&datasets, &spec.file_pools).await?;
+    // A single "Send" has no Stop button of its own to cancel against — a
+    // fresh token here just lets `resolve` share the same cancellation-aware
+    // code path as the load-test/scenario callers (d1b) instead of forking a
+    // separate uncancellable variant.
+    let dyn_state = maelstrom_core::dynval::resolve(
+        &datasets,
+        &spec.file_pools,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
     let ctx = dyn_state.request();
 
     let expanded_url = ctx.expand(spec.url.trim());

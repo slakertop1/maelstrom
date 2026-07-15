@@ -5,7 +5,7 @@ use crate::codec::DynCodec;
 use crate::Proto;
 use http::uri::PathAndQuery;
 use maelstrom_core::histogram::finalize_result;
-use maelstrom_core::types::{LoadTestResult, RunMeta, TimelinePoint};
+use maelstrom_core::types::{LoadTestResult, RunMeta, TimelinePoint, TlsConfig};
 use prost_reflect::{DynamicMessage, MessageDescriptor, SerializeOptions};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 fn status_msg(s: &tonic::Status) -> String {
     format!("{:?}: {}", s.code(), s.message())
@@ -80,15 +80,67 @@ pub fn message_to_json(msg: &DynamicMessage) -> Result<String, String> {
     String::from_utf8(buf).map_err(|e| e.to_string())
 }
 
-async fn connect(endpoint: &str, timeout: Duration) -> Result<Channel, String> {
+/// Build the tonic TLS config for an `https://` endpoint from the shared
+/// [`TlsConfig`] (the same struct the HTTP engine uses for custom CA / mTLS —
+/// see `maelstrom_core::tls::apply_tls`). Native root CAs stay enabled
+/// regardless, so a plain public HTTPS endpoint keeps working exactly as
+/// before; a custom CA is layered on top so a self-signed or internal-CA
+/// server certificate also verifies, and a client cert/key pair is attached
+/// for mTLS.
+///
+/// `insecure` (skip server certificate verification) has no equivalent in
+/// tonic's public transport API — unlike `reqwest` (used by the HTTP
+/// engine's `danger_accept_invalid_certs`), `tonic::transport::ClientTlsConfig`
+/// exposes no such switch, and building one would mean hand-rolling a custom
+/// rustls verifier + connector. Rather than silently accept the flag and
+/// keep verifying anyway — which would look configured but isn't, and could
+/// mislead someone into thinking a self-signed server is reachable when the
+/// handshake is actually still failing — this rejects with a clear message
+/// unless a CA cert is also supplied. Trusting that CA is the supported way
+/// to accept a self-signed/internal server certificate.
+fn build_tls_config(tls: Option<&TlsConfig>) -> Result<ClientTlsConfig, String> {
+    let mut cfg = ClientTlsConfig::new().with_native_roots();
+    let Some(tls) = tls else { return Ok(cfg) };
+
+    let ca_path = tls.ca_cert_pem.as_deref().filter(|p| !p.trim().is_empty());
+    if let Some(path) = ca_path {
+        let pem = std::fs::read(path)
+            .map_err(|e| format!("Не удалось прочитать CA-сертификат {path}: {e}"))?;
+        cfg = cfg.ca_certificate(Certificate::from_pem(pem));
+    }
+
+    let cert_path = tls.client_cert_pem.as_deref().filter(|p| !p.trim().is_empty());
+    let key_path = tls.client_key_pem.as_deref().filter(|p| !p.trim().is_empty());
+    match (cert_path, key_path) {
+        (Some(cert), Some(key)) => {
+            let cert_pem = std::fs::read(cert)
+                .map_err(|e| format!("Не удалось прочитать сертификат {cert}: {e}"))?;
+            let key_pem = std::fs::read(key)
+                .map_err(|e| format!("Не удалось прочитать ключ {key}: {e}"))?;
+            cfg = cfg.identity(Identity::from_pem(cert_pem, key_pem));
+        }
+        (Some(_), None) => return Err("Указан клиентский сертификат, но не указан ключ".to_string()),
+        (None, Some(_)) => return Err("Указан ключ, но не указан клиентский сертификат".to_string()),
+        (None, None) => {}
+    }
+
+    if tls.insecure && ca_path.is_none() {
+        return Err(
+            "TLS: пропуск проверки сертификата (insecure) для gRPC не поддерживается — укажите CA-сертификат сервера (ca_cert_pem), чтобы доверять самоподписанному/внутреннему сертификату"
+                .to_string(),
+        );
+    }
+
+    Ok(cfg)
+}
+
+async fn connect(endpoint: &str, timeout: Duration, tls: Option<&TlsConfig>) -> Result<Channel, String> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .map_err(|e| format!("Неверный адрес «{endpoint}»: {e}"))?
         .timeout(timeout)
         .connect_timeout(timeout);
     if endpoint.trim_start().starts_with("https") {
-        ep = ep
-            .tls_config(ClientTlsConfig::new().with_native_roots())
-            .map_err(|e| format!("TLS: {e}"))?;
+        ep = ep.tls_config(build_tls_config(tls)?).map_err(|e| format!("TLS: {e}"))?;
     }
     ep.connect().await.map_err(|e| format!("Подключение к {endpoint}: {e}"))
 }
@@ -221,6 +273,10 @@ pub struct LoadCall {
     pub client_streaming: bool,
     pub server_streaming: bool,
     pub timeout_ms: u64,
+    /// Custom CA / mTLS client identity applied when `endpoint` is
+    /// `https://` (see [`build_tls_config`]). `None` behaves exactly as
+    /// before: native root CAs only, no client identity.
+    pub tls: Option<TlsConfig>,
 }
 
 /// Result of a single (unary or streaming) JSON call.
@@ -233,6 +289,8 @@ pub struct CallResult {
 
 impl Proto {
     /// Build a reusable [`LoadCall`] from JSON body for the given method.
+    /// Connects with native root CAs only for `https://` endpoints — see
+    /// [`Proto::build_call_with_tls`] for a custom CA / mTLS client identity.
     pub fn build_call(
         &self,
         endpoint: &str,
@@ -240,6 +298,21 @@ impl Proto {
         method: &str,
         json_body: &str,
         timeout_ms: u64,
+    ) -> Result<LoadCall, String> {
+        self.build_call_with_tls(endpoint, service, method, json_body, timeout_ms, None)
+    }
+
+    /// Same as [`Proto::build_call`], but also attaches a TLS configuration
+    /// (custom CA cert and/or client cert/key for mTLS) applied when the call
+    /// connects over `https://`. Ignored for plaintext (`http://`) targets.
+    pub fn build_call_with_tls(
+        &self,
+        endpoint: &str,
+        service: &str,
+        method: &str,
+        json_body: &str,
+        timeout_ms: u64,
+        tls: Option<TlsConfig>,
     ) -> Result<LoadCall, String> {
         let m = self.find_method(service, method)?;
         let inputs = json_to_messages(&m.input(), json_body)?;
@@ -260,6 +333,7 @@ impl Proto {
             client_streaming: m.is_client_streaming(),
             server_streaming: m.is_server_streaming(),
             timeout_ms,
+            tls,
         })
     }
 
@@ -277,6 +351,8 @@ impl Proto {
     }
 
     /// Invoke a method once with a JSON request, returning JSON response(s).
+    /// Connects with native root CAs only for `https://` — see
+    /// [`Proto::call_json_with_tls`] for a custom CA / mTLS client identity.
     pub async fn call_json(
         &self,
         endpoint: &str,
@@ -285,9 +361,24 @@ impl Proto {
         json_body: &str,
         timeout_ms: u64,
     ) -> Result<CallResult, String> {
-        let call = self.build_call(endpoint, service, method, json_body, timeout_ms)?;
+        self.call_json_with_tls(endpoint, service, method, json_body, timeout_ms, None).await
+    }
+
+    /// Same as [`Proto::call_json`], but also attaches a TLS configuration
+    /// (custom CA cert and/or client cert/key for mTLS) — see
+    /// [`Proto::build_call_with_tls`].
+    pub async fn call_json_with_tls(
+        &self,
+        endpoint: &str,
+        service: &str,
+        method: &str,
+        json_body: &str,
+        timeout_ms: u64,
+        tls: Option<TlsConfig>,
+    ) -> Result<CallResult, String> {
+        let call = self.build_call_with_tls(endpoint, service, method, json_body, timeout_ms, tls)?;
         let timeout = Duration::from_millis(timeout_ms.max(100));
-        let channel = connect(&call.endpoint, timeout).await?;
+        let channel = connect(&call.endpoint, timeout, call.tls.as_ref()).await?;
         let started = Instant::now();
         let responses = execute_call(channel, &call, 10_000)
             .await?
@@ -319,7 +410,7 @@ pub async fn grpc_load(
     let timeout = Duration::from_millis(call.timeout_ms.max(100));
 
     // Connect once up front so a bad endpoint fails fast; workers clone the channel.
-    let channel = connect(&call.endpoint, timeout).await?;
+    let channel = connect(&call.endpoint, timeout, call.tls.as_ref()).await?;
     let started_wall = chrono_now();
 
     let limiter = rps_limit.filter(|r| *r > 0).map(|rps| {
@@ -484,4 +575,80 @@ fn chrono_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!("unix:{secs}")
+}
+
+// ---- g4: TLS config wiring (see build_tls_config) ----
+// These are pure/offline: no network, no server. The full round-trip
+// (real TLS handshake, mTLS, and a self-signed cert actually being
+// rejected without a CA) is covered by grpc/tests/integration.rs, which
+// spins up a real tonic server using the fixtures in testdata/certs.
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    fn test_cert_path(name: &str) -> String {
+        format!("{}/../testdata/certs/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn no_tls_config_is_fine() {
+        assert!(build_tls_config(None).is_ok());
+    }
+
+    #[test]
+    fn insecure_without_ca_is_rejected_with_clear_message() {
+        let tls = TlsConfig { insecure: true, ..Default::default() };
+        let err = build_tls_config(Some(&tls)).unwrap_err();
+        assert!(err.contains("insecure"), "got {err}");
+    }
+
+    #[test]
+    fn insecure_with_ca_is_accepted() {
+        // insecure alongside a CA cert is a no-op, not an error: the CA
+        // already covers the use case insecure exists for (trusting a
+        // self-signed/internal server certificate).
+        let tls = TlsConfig {
+            insecure: true,
+            ca_cert_pem: Some(test_cert_path("ca.pem")),
+            ..Default::default()
+        };
+        assert!(build_tls_config(Some(&tls)).is_ok());
+    }
+
+    #[test]
+    fn ca_cert_pem_is_applied() {
+        let tls = TlsConfig { ca_cert_pem: Some(test_cert_path("ca.pem")), ..Default::default() };
+        assert!(build_tls_config(Some(&tls)).is_ok());
+    }
+
+    #[test]
+    fn missing_ca_file_is_a_clear_error() {
+        let tls = TlsConfig { ca_cert_pem: Some(test_cert_path("does-not-exist.pem")), ..Default::default() };
+        let err = build_tls_config(Some(&tls)).unwrap_err();
+        assert!(err.contains("CA-сертификат"), "got {err}");
+    }
+
+    #[test]
+    fn client_identity_is_applied_for_mtls() {
+        let tls = TlsConfig {
+            client_cert_pem: Some(test_cert_path("client.pem")),
+            client_key_pem: Some(test_cert_path("client.key")),
+            ..Default::default()
+        };
+        assert!(build_tls_config(Some(&tls)).is_ok());
+    }
+
+    #[test]
+    fn client_cert_without_key_is_rejected() {
+        let tls = TlsConfig { client_cert_pem: Some(test_cert_path("client.pem")), ..Default::default() };
+        let err = build_tls_config(Some(&tls)).unwrap_err();
+        assert!(err.contains("ключ"), "got {err}");
+    }
+
+    #[test]
+    fn client_key_without_cert_is_rejected() {
+        let tls = TlsConfig { client_key_pem: Some(test_cert_path("client.key")), ..Default::default() };
+        let err = build_tls_config(Some(&tls)).unwrap_err();
+        assert!(err.contains("сертификат"), "got {err}");
+    }
 }

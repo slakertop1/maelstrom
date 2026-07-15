@@ -171,6 +171,42 @@ describe("redactLiteralSecrets (f1 + f4)", () => {
     );
   });
 
+  it("does not merge a literal secret into an existing ${VAR} placeholder that already uses the same generated name", () => {
+    // The config already references an Environment secret var named
+    // AWS_ACCESS_KEY_ID via ${AWS_ACCESS_KEY_ID} (from envVars(env,
+    // forExport=true)/{{name}} indirection elsewhere), but a *different*,
+    // literal AWS key also needs redacting on another dataset source. The
+    // literal one must NOT be renamed to the same ${AWS_ACCESS_KEY_ID} —
+    // that would silently fuse two unrelated secrets into one placeholder.
+    const cfg = JSON.stringify({
+      targets: [{ headers: [["X-Env-Key", "${AWS_ACCESS_KEY_ID}"]] }],
+      datasets: [
+        {
+          name: "clients",
+          source: {
+            kind: "url",
+            url: "https://bucket/clients.csv",
+            aws: {
+              access_key_id: "AKIAABCDEFGHIJKLMNOP",
+              secret_access_key: null,
+              region: "us-east-1",
+              session_token: null,
+            },
+          },
+        },
+      ],
+    });
+    const { json: out, findings } = redactLiteralSecrets(cfg);
+    expect(findings.length).toBe(1);
+    expect(out).not.toContain("AKIAABCDEFGHIJKLMNOP");
+    const parsed = JSON.parse(out);
+    // The pre-existing env-var placeholder is left exactly as it was.
+    expect(parsed.targets[0].headers[0][1]).toBe("${AWS_ACCESS_KEY_ID}");
+    // The literal secret gets a distinct name instead of colliding with it.
+    expect(parsed.datasets[0].source.aws.access_key_id).toBe("${AWS_ACCESS_KEY_ID_2}");
+    expect(requiredEnvVars(out)).toEqual(["AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID_2"]);
+  });
+
   it("making the config self-contained: requiredEnvVars reflects the auto-redacted names, not the old false 'no secrets' state", () => {
     // Before the fix, a config with only a literal secret (no pre-existing
     // ${VAR}) would report requiredEnvVars() === [] and the modal would show

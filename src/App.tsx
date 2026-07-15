@@ -23,7 +23,7 @@ import {
 } from "./api";
 import { buildHttpScenario, buildGrpcScenario, buildWsScenario } from "./cliExport";
 import { resolveVars, envVars } from "./vars";
-import { buildRequest, buildAuthRefresh, unresolvedVars, builtStrings } from "./requestBuilder";
+import { buildRequest, buildAuthRefresh, unresolvedVars, builtStrings, toTlsSpec } from "./requestBuilder";
 import { useT, tr, tr2, useLang } from "./i18n";
 import { importOpenApi } from "./openapi";
 import { buildReportHtml, buildScenarioReportHtml } from "./report";
@@ -383,7 +383,11 @@ export default function App() {
   }, []);
 
   // ---- auth profiles (reusable auth setups) ----
-  const saveAuthProfile = () => {
+  // a7 perf: these are useCallback-wrapped (stable references, deps trimmed to
+  // what they actually read) so Sidebar/RequestEditor — wrapped in React.memo
+  // below — don't re-render on every load-test progress tick just because App
+  // re-rendered and would otherwise hand them a fresh function each time.
+  const saveAuthProfile = useCallback(() => {
     if (current.auth.type === "none") return;
     const auth = structuredClone(current.auth);
     // A profile stores CREDENTIALS, not the volatile token: an access token
@@ -400,62 +404,72 @@ export default function App() {
       for (let i = 2; ps.some((p) => p.name === name); i++) name = `${base} (${i})`;
       return [...ps, { id: uid(), name, auth }];
     });
-  };
-  const deleteAuthProfile = (id: string) =>
-    setAuthProfiles((ps) => ps.filter((p) => p.id !== id));
+  }, [current]);
+  const deleteAuthProfile = useCallback(
+    (id: string) => setAuthProfiles((ps) => ps.filter((p) => p.id !== id)),
+    []
+  );
 
   // ---- request actions ----
-  const openRequest = (collectionId: string, req: RequestConfig) => {
-    // Unsaved edits must survive switching requests: silently dropping them is
-    // how auth settings "reset" (edit request B → peek at request A → return to
-    // B and the changes are gone). Auto-save the current request first; when
-    // re-opening the same request, keep the edited copy (the `req` object from
-    // the sidebar render props is the stale pre-save version).
-    if (dirty && current) saveRequest(current);
-    const target = dirty && current && current.id === req.id ? current : req;
-    setCurrent(structuredClone(target));
-    setSourceCollectionId(collectionId);
-    setDirty(false);
-    setResponse(null);
-    setRespError(null);
-    setDbResult(null);
-    setGrpcResult(null);
-    setWsResult(null);
-  };
+  // saveRequest/saveCurrent are declared before openRequest so openRequest's
+  // useCallback can depend on the stable saveRequest reference.
+  const saveRequest = useCallback(
+    (req: RequestConfig) => {
+      let colId = sourceCollectionId;
+      if (!colId || !collections.some((c) => c.id === colId)) {
+        colId = collections[0]?.id ?? null;
+        if (!colId) {
+          const col: Collection = { id: uid(), name: t("My collection"), requests: [] };
+          setCollections([{ ...col, requests: [structuredClone(req)] }]);
+          setSourceCollectionId(col.id);
+          setDirty(false);
+          return;
+        }
+      }
+      setCollections((cols) =>
+        cols.map((c) => {
+          if (c.id !== colId) return c;
+          const exists = c.requests.some((r) => r.id === req.id);
+          return {
+            ...c,
+            requests: exists
+              ? c.requests.map((r) => (r.id === req.id ? structuredClone(req) : r))
+              : [...c.requests, structuredClone(req)],
+          };
+        })
+      );
+      setSourceCollectionId(colId);
+      setDirty(false);
+    },
+    [sourceCollectionId, collections, t]
+  );
+  const saveCurrent = useCallback(() => saveRequest(current), [current, saveRequest]);
 
-  const changeCurrent = (req: RequestConfig) => {
+  const openRequest = useCallback(
+    (collectionId: string, req: RequestConfig) => {
+      // Unsaved edits must survive switching requests: silently dropping them is
+      // how auth settings "reset" (edit request B → peek at request A → return to
+      // B and the changes are gone). Auto-save the current request first; when
+      // re-opening the same request, keep the edited copy (the `req` object from
+      // the sidebar render props is the stale pre-save version).
+      if (dirty && current) saveRequest(current);
+      const target = dirty && current && current.id === req.id ? current : req;
+      setCurrent(structuredClone(target));
+      setSourceCollectionId(collectionId);
+      setDirty(false);
+      setResponse(null);
+      setRespError(null);
+      setDbResult(null);
+      setGrpcResult(null);
+      setWsResult(null);
+    },
+    [dirty, current, saveRequest]
+  );
+
+  const changeCurrent = useCallback((req: RequestConfig) => {
     setCurrent(req);
     setDirty(true);
-  };
-
-  const saveRequest = (req: RequestConfig) => {
-    let colId = sourceCollectionId;
-    if (!colId || !collections.some((c) => c.id === colId)) {
-      colId = collections[0]?.id ?? null;
-      if (!colId) {
-        const col: Collection = { id: uid(), name: t("My collection"), requests: [] };
-        setCollections([{ ...col, requests: [structuredClone(req)] }]);
-        setSourceCollectionId(col.id);
-        setDirty(false);
-        return;
-      }
-    }
-    setCollections((cols) =>
-      cols.map((c) => {
-        if (c.id !== colId) return c;
-        const exists = c.requests.some((r) => r.id === req.id);
-        return {
-          ...c,
-          requests: exists
-            ? c.requests.map((r) => (r.id === req.id ? structuredClone(req) : r))
-            : [...c.requests, structuredClone(req)],
-        };
-      })
-    );
-    setSourceCollectionId(colId);
-    setDirty(false);
-  };
-  const saveCurrent = () => saveRequest(current);
+  }, []);
 
   const executeSend = useCallback(async () => {
     // Captured now (before any await) so a slow response can tell, on arrival,
@@ -497,6 +511,7 @@ export default function App() {
           method: g.method,
           body: resolveVars(g.body, vars),
           timeout_ms: 30000,
+          tls: toTlsSpec(g.tls),
         });
         if (currentIdRef.current === reqId) setGrpcResult(res);
       } else if (current.kind === "ws") {
@@ -556,7 +571,7 @@ export default function App() {
   }, [current, activeEnv, executeSend]);
 
   // ---- OAuth2 token acquisition ----
-  const fetchToken = async (): Promise<string> => {
+  const fetchToken = useCallback(async (): Promise<string> => {
     const cfg = current.auth.oauth2;
     const vars = activeVars(activeEnv);
     const resolved = {
@@ -619,10 +634,10 @@ export default function App() {
       setTokenUrls((h) => [rawUrl, ...h.filter((u) => u !== rawUrl)].slice(0, 15));
     }
     return resp.access_token;
-  };
+  }, [current, activeEnv, t]);
 
   // ---- load test actions ----
-  const executeLoadTest = async () => {
+  const executeLoadTest = useCallback(async () => {
     // Synchronous guard: a second click before this render commits still sees
     // the stale (pre-update) `ltRunning` from the closure, so without gating
     // on a ref here a fast double-click starts two overlapping runs (pa1).
@@ -665,6 +680,7 @@ export default function App() {
           duration_secs: ltConfig.durationSecs,
           rps_limit,
           timeout_ms: ltConfig.timeoutMs,
+          tls: toTlsSpec(g.tls),
         });
       } else if (current.kind === "ws") {
         const vars = activeVars(activeEnv);
@@ -703,9 +719,9 @@ export default function App() {
       setLtRunning(false);
       setLtError(String(e));
     }
-  };
+  }, [ltConfig, current, activeEnv, datasets]);
 
-  const doStartLoadTest = () => {
+  const doStartLoadTest = useCallback(() => {
     let missing: string[];
     if (current.kind === "db") {
       const vars = activeVars(activeEnv);
@@ -733,14 +749,14 @@ export default function App() {
       return;
     }
     executeLoadTest();
-  };
+  }, [current, activeEnv, t, executeLoadTest]);
 
-  const doStopLoadTest = () => {
+  const doStopLoadTest = useCallback(() => {
     stopLoadTest().catch(() => {});
-  };
+  }, []);
 
   // ---- scenario (multi-endpoint) load ----
-  const openScenario = (collectionId: string) => {
+  const openScenario = useCallback((collectionId: string) => {
     // Switching collections (the sidebar's ⚡ icon calls this directly,
     // without going through closeScenario) while a previous run's stop
     // hasn't been confirmed must not let its stale events land on THIS view
@@ -753,7 +769,7 @@ export default function App() {
     setScProgress(null);
     setScProgressLog([]);
     setScError(null);
-  };
+  }, [scRunning]);
 
   const closeScenario = () => {
     if (scRunning) stopLoadTest().catch(() => {});
@@ -827,7 +843,7 @@ export default function App() {
   };
 
   // ---- streams (request chaining) load ----
-  const openStreams = (collectionId: string) => {
+  const openStreams = useCallback((collectionId: string) => {
     // See openScenario above — same reasoning (a1).
     if (stRunning) stopLoadTest().catch(() => {});
     stGenRef.current = 0;
@@ -836,7 +852,7 @@ export default function App() {
     setStResult(null);
     setStProgress(null);
     setStError(null);
-  };
+  }, [stRunning]);
   const closeStreams = () => {
     if (stRunning) stopLoadTest().catch(() => {});
     // See closeScenario above — same reasoning (a1).
@@ -968,7 +984,7 @@ export default function App() {
   };
 
   // Export the CURRENT single request (from the Load tab) as a CLI scenario.json.
-  const exportSingleRequestConfig = () => {
+  const exportSingleRequestConfig = useCallback(() => {
     if (current.kind === "db") {
       alert(t("The headless CLI doesn't run database load tests — export is available for HTTP, gRPC and WebSocket."));
       return;
@@ -986,6 +1002,7 @@ export default function App() {
         service: g.service,
         method: g.method,
         body: r(g.body),
+        tls: toTlsSpec(g.tls),
       });
     } else if (current.kind === "ws") {
       const w = current.ws;
@@ -1012,7 +1029,7 @@ export default function App() {
       json: JSON.stringify(cfg, null, 2),
       defaultName: `maelstrom-${safeName || "load"}.json`,
     });
-  };
+  }, [current, t, ltConfig, activeEnv, datasets]);
 
   const exportScenarioReport = async () => {
     if (!scResult) return;
@@ -1029,7 +1046,7 @@ export default function App() {
     }
   };
 
-  const exportReport = async (kind: "html" | "json") => {
+  const exportReport = useCallback(async (kind: "html" | "json") => {
     if (!ltResult) return;
     try {
       const stamp = ltResult.started_at.replace(/[: ]/g, "-");
@@ -1048,9 +1065,9 @@ export default function App() {
     } catch (e) {
       alert(`${t("Failed to save the file:")}\n${String(e)}`);
     }
-  };
+  }, [ltResult, t]);
 
-  const importSpec = async () => {
+  const importSpec = useCallback(async () => {
     const path = await open({
       multiple: false,
       filters: [
@@ -1081,41 +1098,96 @@ export default function App() {
     } catch (e) {
       alert(`${t("Failed to import the specification:")}\n${String(e)}`);
     }
-  };
+  }, [openRequest, t]);
 
   // ---- sidebar actions ----
-  const addCollection = () =>
-    setCollections((c) => [
-      ...c,
-      { id: uid(), name: tr2("Collection {n}", { n: c.length + 1 }), requests: [] },
-    ]);
+  const addCollection = useCallback(
+    () =>
+      setCollections((c) => [
+        ...c,
+        { id: uid(), name: tr2("Collection {n}", { n: c.length + 1 }), requests: [] },
+      ]),
+    []
+  );
 
-  const addRequest = (collectionId: string) => {
-    const req = newRequest();
-    setCollections((cols) =>
-      cols.map((c) =>
-        c.id === collectionId ? { ...c, requests: [...c.requests, req] } : c
-      )
-    );
-    openRequest(collectionId, req);
-  };
+  const addRequest = useCallback(
+    (collectionId: string) => {
+      const req = newRequest();
+      setCollections((cols) =>
+        cols.map((c) =>
+          c.id === collectionId ? { ...c, requests: [...c.requests, req] } : c
+        )
+      );
+      openRequest(collectionId, req);
+    },
+    [openRequest]
+  );
 
-  const deleteRequest = (collectionId: string, requestId: string) =>
-    setCollections((cols) =>
-      cols.map((c) =>
-        c.id === collectionId
-          ? { ...c, requests: c.requests.filter((r) => r.id !== requestId) }
-          : c
-      )
-    );
+  const deleteRequest = useCallback(
+    (collectionId: string, requestId: string) =>
+      setCollections((cols) =>
+        cols.map((c) =>
+          c.id === collectionId
+            ? { ...c, requests: c.requests.filter((r) => r.id !== requestId) }
+            : c
+        )
+      ),
+    []
+  );
 
-  const deleteCollection = (collectionId: string) =>
-    setCollections((cols) => cols.filter((c) => c.id !== collectionId));
+  const deleteCollection = useCallback(
+    (collectionId: string) =>
+      setCollections((cols) => cols.filter((c) => c.id !== collectionId)),
+    []
+  );
 
-  const renameCollection = (collectionId: string, name: string) =>
-    setCollections((cols) =>
-      cols.map((c) => (c.id === collectionId ? { ...c, name } : c))
-    );
+  const renameCollection = useCallback(
+    (collectionId: string, name: string) =>
+      setCollections((cols) =>
+        cols.map((c) => (c.id === collectionId ? { ...c, name } : c))
+      ),
+    []
+  );
+
+  // a7 perf: the load-test panel embeds live progress/timeline state that
+  // ticks ~1/s while a run is active. Building this element inline in the
+  // JSX below would hand RequestEditor (React.memo'd) a brand-new `loadTestPanel`
+  // ReactNode on every App render — defeating its memoization even when
+  // nothing load-test-related changed (e.g. editing the sidebar, switching
+  // environments). Memoizing it here means RequestEditor only re-renders for
+  // this prop when one of the load-test values below actually changes.
+  const loadTestPanel = useMemo(
+    () => (
+      <LoadTestPanel
+        running={ltRunning}
+        progress={ltProgress}
+        timeline={ltTimeline}
+        result={ltResult}
+        error={ltError}
+        config={ltConfig}
+        setConfig={setLtConfig}
+        onStart={doStartLoadTest}
+        onStop={doStopLoadTest}
+        onExportHtml={() => exportReport("html")}
+        onExportJson={() => exportReport("json")}
+        onExportConfig={exportSingleRequestConfig}
+        tokenRefreshes={tokenRefreshes}
+      />
+    ),
+    [
+      ltRunning,
+      ltProgress,
+      ltTimeline,
+      ltResult,
+      ltError,
+      ltConfig,
+      doStartLoadTest,
+      doStopLoadTest,
+      exportReport,
+      exportSingleRequestConfig,
+      tokenRefreshes,
+    ]
+  );
 
   return (
     <div className="app">
@@ -1240,23 +1312,7 @@ export default function App() {
                 onDeleteAuthProfile={deleteAuthProfile}
                 onTabChange={setEditorTab}
                 loadTestRunning={ltRunning}
-                loadTestPanel={
-                  <LoadTestPanel
-                    running={ltRunning}
-                    progress={ltProgress}
-                    timeline={ltTimeline}
-                    result={ltResult}
-                    error={ltError}
-                    config={ltConfig}
-                    setConfig={setLtConfig}
-                    onStart={doStartLoadTest}
-                    onStop={doStopLoadTest}
-                    onExportHtml={() => exportReport("html")}
-                    onExportJson={() => exportReport("json")}
-                    onExportConfig={exportSingleRequestConfig}
-                    tokenRefreshes={tokenRefreshes}
-                  />
-                }
+                loadTestPanel={loadTestPanel}
               />
             </div>
             {editorTab !== "load" &&

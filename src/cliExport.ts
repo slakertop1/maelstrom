@@ -34,6 +34,7 @@ export interface GrpcBlock {
   service: string;
   method: string;
   body: string;
+  tls?: TlsSpec | null;
 }
 
 export interface WsBlock {
@@ -101,6 +102,7 @@ export function buildGrpcScenario(name: string, lt: LoadCfg, g: GrpcBlock) {
       service: g.service,
       method: g.method,
       body: g.body,
+      tls: g.tls ?? null,
       vus: lt.vus,
       rps_limit: rpsLimitOrNull(lt),
       timeout_ms: lt.timeoutMs,

@@ -1,8 +1,9 @@
 import { useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { GrpcConfig, GrpcMethodInfo } from "../types";
+import { GrpcConfig, GrpcMethodInfo, newTls } from "../types";
 import { grpcListMethods, grpcRequestTemplate } from "../api";
 import { useT } from "../i18n";
+import TlsEditor from "./TlsEditor";
 
 interface Props {
   config: GrpcConfig;
@@ -124,6 +125,11 @@ export default function GrpcEditor({ config, onChange }: Props) {
           rows={2}
         />
         <button onClick={addImportDir}>{t("+ Folder…")}</button>
+      </div>
+
+      <div title={t("Custom TLS for the server address above: trust a self-signed / internal CA certificate, or present a client certificate for mTLS. Leave off for plain http:// or a publicly trusted https:// certificate.")}>
+        <div className="tls-section-title">{t("TLS / mTLS")}</div>
+        <TlsEditor tls={config.tls ?? newTls()} onChange={(tls) => set({ tls })} />
       </div>
 
       <div className="grpc-row">

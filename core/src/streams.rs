@@ -182,7 +182,7 @@ pub async fn run_streams(
 
     // Data providers (datasets + file pools) once, up front.
     let dyn_state = Arc::new(
-        crate::dynval::resolve(&spec.datasets, &spec.file_pools)
+        crate::dynval::resolve(&spec.datasets, &spec.file_pools, &cancel)
             .await
             .map_err(&log_err)?,
     );
@@ -226,6 +226,13 @@ pub async fn run_streams(
 
     let mut result =
         aggregate(rx, &names, &step_meta, spec.duration_secs, started, &cancel, on_progress).await;
+    // Capture BEFORE the cleanup `cancel()` below. The run is only "stopped
+    // early" if the token was already cancelled (user Stop / abort) by the time
+    // aggregation finished; a normal deadline completion leaves it un-cancelled.
+    // Reading it *after* `cancel.cancel()` would always be true and mislabel
+    // every full run as "(остановлено)". (The JSON `stopped_early`, computed
+    // inside `aggregate`, is already correct — this only fixes the log line.)
+    let stopped_early = cancel.is_cancelled();
     cancel.cancel();
     result.started_at = started_wall;
 
@@ -246,7 +253,7 @@ pub async fn run_streams(
         result.overall.total_requests,
         result.overall.errors,
         result.overall.error_rate,
-        if cancel.is_cancelled() { " (остановлено)" } else { "" }
+        if stopped_early { " (остановлено)" } else { "" }
     ));
     Ok(result)
 }

@@ -1,4 +1,4 @@
-import { ReactNode, useState } from "react";
+import { memo, ReactNode, useState } from "react";
 import { BodyType, RequestConfig } from "../types";
 import KeyValueEditor from "./KeyValueEditor";
 import MultipartEditor from "./MultipartEditor";
@@ -30,7 +30,14 @@ interface Props {
 
 type Tab = "params" | "headers" | "body" | "auth" | "tls" | "assert" | "load";
 
-export default function RequestEditor(p: Props) {
+// a7 perf: React.memo'd. App stabilizes onChange/onSave/onFetchToken/
+// onSaveAuthProfile/onDeleteAuthProfile via useCallback and memoizes
+// loadTestPanel via useMemo, so this only re-renders when `request`/`dirty`/
+// `sending` actually change or the load-test panel's own data changes (it
+// still updates live while a run is in progress and the Load tab is open —
+// see the comment on `loadTestPanel` in App.tsx for the residual case where
+// a run keeps ticking while the user is on a different tab).
+function RequestEditor(p: Props) {
   const t = useT();
   const [tab, setTabRaw] = useState<Tab>("params");
   const setTab = (t: Tab) => {
@@ -273,6 +280,8 @@ export default function RequestEditor(p: Props) {
     </>
   );
 }
+
+export default memo(RequestEditor);
 
 function WsBar({
   request,

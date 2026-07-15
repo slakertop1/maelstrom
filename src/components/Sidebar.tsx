@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { Collection, RequestConfig } from "../types";
 import { useT, tr2 } from "../i18n";
 
@@ -16,7 +16,10 @@ interface Props {
   onStreams: (collectionId: string) => void;
 }
 
-export default function Sidebar(p: Props) {
+// a7 perf: wrapped in React.memo — App now hands it stable (useCallback'd)
+// handler props, so this only re-renders when collections/activeRequestId
+// actually change, not on every load-test progress tick.
+function Sidebar(p: Props) {
   const t = useT();
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -157,3 +160,5 @@ export default function Sidebar(p: Props) {
     </div>
   );
 }
+
+export default memo(Sidebar);

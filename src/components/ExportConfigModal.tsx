@@ -81,7 +81,12 @@ export function redactLiteralSecrets(json: string): { json: string; findings: Se
   }
 
   const findings: SecretFinding[] = [];
-  const used = new Set<string>();
+  // Seed with every ${VAR} placeholder already present in the config (e.g.
+  // an Environment secret var referenced via {{name}} and turned into
+  // ${NAME} upstream by envVars(env, forExport=true)) — otherwise a freshly
+  // generated name here could collide with one of those and silently merge
+  // two unrelated secrets under a single placeholder.
+  const used = new Set<string>(requiredEnvVars(json));
   const freshName = (base: string): string => {
     let name = base;
     for (let i = 2; used.has(name); i++) name = `${base}_${i}`;

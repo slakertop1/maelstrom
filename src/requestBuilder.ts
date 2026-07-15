@@ -25,7 +25,7 @@ export interface BuiltRequest {
   file_pools: FilePoolSpec[];
 }
 
-function toTlsSpec(tls: TlsConfig): TlsSpec | null {
+export function toTlsSpec(tls: TlsConfig): TlsSpec | null {
   if (!tls.enabled) return null;
   const spec: TlsSpec = {
     client_cert_pem: tls.client_cert_pem.trim() || null,

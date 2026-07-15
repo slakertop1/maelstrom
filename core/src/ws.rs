@@ -113,6 +113,24 @@ async fn round_trip(ws: &mut Ws, message: &str, timeout: Duration, cancel: &Canc
     ((start.elapsed().as_micros().max(1)) as u64, ok)
 }
 
+/// Send one latency sample, but never block past cancellation: if the bounded
+/// result channel is full (aggregator lagging) and `cancel` fires while we're
+/// waiting, stop trying to send instead of sitting in `send().await` until the
+/// buffer drains — at the 10k-VU ceiling that drain can take a while, and Stop
+/// is supposed to be immediate. Returns `true` if the caller's loop should
+/// break (cancelled, or the receiver is gone), `false` to keep going as usual.
+async fn send_or_stop(
+    tx: &mpsc::Sender<(u64, bool)>,
+    sample: (u64, bool),
+    cancel: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => true,
+        r = tx.send(sample) => r.is_err(),
+    }
+}
+
 /// Load-test a WebSocket endpoint: `vus` persistent connections, each repeatedly
 /// sending `message` and awaiting a reply. Reconnects on failure.
 pub async fn ws_load(
@@ -181,7 +199,9 @@ pub async fn ws_load(
                     match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(&*url)).await {
                         Ok(Ok((ws, _))) => conn = Some(ws),
                         _ => {
-                            let _ = tx.send((timeout.as_micros() as u64, false)).await;
+                            if send_or_stop(&tx, (timeout.as_micros() as u64, false), &cancel).await {
+                                break;
+                            }
                             tokio::time::sleep(Duration::from_millis(25)).await;
                             continue;
                         }
@@ -198,7 +218,7 @@ pub async fn ws_load(
                         let _ = tokio::time::timeout(Duration::from_millis(200), dead.close(None)).await;
                     }
                 }
-                if tx.send((latency_us, ok)).await.is_err() {
+                if send_or_stop(&tx, (latency_us, ok), &cancel).await {
                     break;
                 }
                 if !ok {
@@ -350,5 +370,31 @@ mod tests {
         assert_eq!(result.method, "WS");
         assert!(result.total_requests > 0, "no round-trips");
         assert_eq!(result.errors, 0, "unexpected errors");
+    }
+
+    // Regression for w2: a VU must not block in tx.send().await past cancellation
+    // when the bounded result channel is full (aggregator lagging behind). Fill
+    // the channel's single slot and keep the receiver alive-but-idle so a plain
+    // `.await` would hang until something drains it; only `cancel` should be
+    // able to unstick `send_or_stop`.
+    #[tokio::test]
+    async fn send_or_stop_unblocks_on_cancel_when_channel_full() {
+        let (tx, _rx) = mpsc::channel::<(u64, bool)>(1);
+        tx.send((1, true)).await.unwrap(); // fill the only slot
+
+        let cancel = CancellationToken::new();
+        let tx2 = tx.clone();
+        let cancel2 = cancel.clone();
+        let handle = tokio::spawn(async move { send_or_stop(&tx2, (2, true), &cancel2).await });
+
+        // Let the spawned task actually reach the blocked send.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+
+        let stopped = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("send_or_stop stayed blocked on the full channel past cancellation")
+            .unwrap();
+        assert!(stopped, "cancelled send must report stop=true");
     }
 }

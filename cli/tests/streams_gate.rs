@@ -123,3 +123,36 @@ fn cli_flag_overrides_a_laxer_config_floor() {
     // Stricter CLI flag overrides the config → 0% < 99 → breach (exit 1).
     assert_eq!(run_cli("override", &cfg, &["--min-success-rate", "99"]), 1, "--min-success-rate overrides config");
 }
+
+#[test]
+fn zero_iterations_gates_even_at_a_lax_floor() {
+    // c1-deeper regression: a run that completes 0 iterations for a stream
+    // must fail any gate that has a threshold set for it — even the laxest
+    // possible floor (0%) — because success_rate on 0 started iterations
+    // reads as a trivial 0.0 (same value a real 0%-completion stream would
+    // report), so a floor of 0 would otherwise pass it silently.
+    //
+    // `duration_secs: 1` and `rps: 1` are both the engine's own minimums
+    // (durations/rps below that are clamped up to exactly these values).
+    // With rps=1, the dispatcher's first possible iteration lands exactly at
+    // the 1s mark — but the run's global deadline (computed strictly before
+    // the per-stream dispatcher task starts) always crosses that same 1s
+    // mark first, so the dispatcher's `biased` select always takes the
+    // deadline branch first and never fires a single iteration. This makes
+    // "0 iterations" reachable deterministically through ordinary config,
+    // not a race — the exact "vырожденный конфиг" scenario the gate must
+    // catch.
+    let base = spawn_mock();
+    let cfg = format!(
+        r#"{{
+            "duration_secs": 1, "timeout_ms": 3000,
+            "thresholds": {{"min_success_rate": 0}},
+            "streams": [{{"name":"never-fires","rps":1,"steps":[{{"name":"ok","method":"GET","url":"{base}/ok"}}]}}]
+        }}"#
+    );
+    assert_eq!(
+        run_cli("zero-iters", &cfg, &[]),
+        1,
+        "0 iterations executed with a threshold set must fail the gate, not silently pass a lax floor"
+    );
+}

@@ -142,8 +142,17 @@ pub async fn start_load_test(
             let _ = app_emit.emit("token_refreshed", n);
             crate::log::write(&app_emit, "TOKEN", &format!("автообновление токена #{n}"));
         });
+        // A packaged GUI build has no visible stderr, so a background refresh
+        // failure (oauth.rs's own eprintln!) would otherwise vanish silently
+        // mid-run. Mirror it into maelstrom.log, same as every other engine
+        // event, so it shows up in the app's log viewer (r4).
+        let app_err = app.clone();
+        let on_error: Arc<dyn Fn(String) + Send + Sync> =
+            Arc::new(move |msg| crate::log::write(&app_err, "TOKEN ✗", &msg));
         crate::log::write(&app, "TOKEN", "получение токена для нагрузки…");
-        match maelstrom_core::oauth::start_token_refresher(cfg, token.clone(), on_refresh).await {
+        match maelstrom_core::oauth::start_token_refresher(cfg, token.clone(), on_refresh, on_error)
+            .await
+        {
             Ok(t) => {
                 crate::log::write(&app, "TOKEN", "токен получен");
                 Some(t)
@@ -170,7 +179,8 @@ pub async fn start_load_test(
             ),
         );
     }
-    let dyn_state = match maelstrom_core::dynval::resolve(&spec.datasets, &spec.file_pools).await {
+    let dyn_state = match maelstrom_core::dynval::resolve(&spec.datasets, &spec.file_pools, &token).await
+    {
         Ok(d) => Arc::new(d),
         Err(e) => {
             // Stop the already-started token refresher too.
