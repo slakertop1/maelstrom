@@ -20,6 +20,115 @@ export function applyRenames(json: string, renames: Record<string, string>): str
 
 const sanitize = (s: string) => s.replace(/[^A-Za-z0-9_]/g, "");
 
+// ---- literal-secret detection & auto-redaction -----------------------------
+//
+// envVars(env, forExport=true) (vars.ts) already turns *Environment* secret
+// vars referenced via {{name}} into ${NAME} placeholders — but a value typed
+// straight into a credential field (an OAuth client secret, a Basic-auth
+// password, a Bearer token, a TLS private key, an AWS key on a dataset
+// source) never goes through that indirection, so it gets baked into the
+// exported JSON as recoverable plain text while the UI claims the file is
+// "self-contained". The CLI expands ${VAR} by substituting the raw config
+// *text* before it parses JSON (cli/src/main.rs `expand_env`), so dropping a
+// ${NAME} placeholder anywhere inside a string value — including mid-string,
+// e.g. "Bearer ${TOKEN}" — is safe and gets resolved at run time. That means
+// the redaction below can happen entirely here, without any App.tsx wiring.
+
+/// JSON object keys that hold credential material in the exported scenario
+/// shapes (OAuthRefreshSpec, TlsSpec, AwsAuth) — if the value is non-empty
+/// and isn't already a ${VAR} reference, it's a literal secret sitting in
+/// the file in plain text.
+const SECRET_FIELD_ENV_NAME: Record<string, string> = {
+  client_secret: "OAUTH_CLIENT_SECRET",
+  password: "OAUTH_PASSWORD",
+  refresh_token: "OAUTH_REFRESH_TOKEN",
+  access_key_id: "AWS_ACCESS_KEY_ID",
+  secret_access_key: "AWS_SECRET_ACCESS_KEY",
+  session_token: "AWS_SESSION_TOKEN",
+  client_key_pem: "TLS_CLIENT_KEY_PEM",
+};
+
+/// A value carries no literal secret when it's empty, or when it's made up
+/// entirely of ${VAR} reference(s) — i.e. every character sits inside one.
+function isPlaceholderOrEmpty(v: string): boolean {
+  const t = v.trim();
+  if (!t) return true;
+  return /^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\})+$/.test(t);
+}
+
+export interface SecretFinding {
+  /** Dotted JSON path (or header name) that held a literal secret. */
+  path: string;
+}
+
+/// Scan a built scenario config for literal secrets — known credential
+/// fields plus `Authorization: Bearer <token>` / `Basic <base64>` headers —
+/// and replace each one with a fresh ${NAME} placeholder. Returns the
+/// rewritten JSON and what was found, so the modal can warn instead of
+/// falsely claiming the file is self-contained.
+///
+/// Basic auth is always redacted when present: the header is built as
+/// `"Basic " + btoa(user + ":" + password)`, so even a password that came
+/// from a secret Environment var is base64-encoded *before* export — the
+/// literal ${VAR} text never survives inside the blob — leaving no way to
+/// keep it self-contained other than replacing the whole credential.
+export function redactLiteralSecrets(json: string): { json: string; findings: SecretFinding[] } {
+  let root: unknown;
+  try {
+    root = JSON.parse(json);
+  } catch {
+    return { json, findings: [] }; // not JSON (shouldn't happen) — leave untouched
+  }
+
+  const findings: SecretFinding[] = [];
+  const used = new Set<string>();
+  const freshName = (base: string): string => {
+    let name = base;
+    for (let i = 2; used.has(name); i++) name = `${base}_${i}`;
+    used.add(name);
+    return name;
+  };
+
+  const walk = (node: unknown, path: string): unknown => {
+    if (Array.isArray(node)) {
+      // A header pair: ["Authorization", "Bearer xxx" | "Basic yyy"].
+      if (node.length === 2 && typeof node[0] === "string" && typeof node[1] === "string") {
+        const [name, value] = node as [string, string];
+        if (name.toLowerCase() === "authorization") {
+          const bearer = /^Bearer\s+(.+)$/.exec(value);
+          if (bearer && !isPlaceholderOrEmpty(bearer[1])) {
+            findings.push({ path: `${path}[Authorization: Bearer]` });
+            return [name, `Bearer \${${freshName("BEARER_TOKEN")}}`];
+          }
+          const basic = /^Basic\s+(.+)$/.exec(value);
+          if (basic && !isPlaceholderOrEmpty(basic[1])) {
+            findings.push({ path: `${path}[Authorization: Basic]` });
+            return [name, `Basic \${${freshName("BASIC_AUTH")}}`];
+          }
+        }
+      }
+      return node.map((v, i) => walk(v, `${path}[${i}]`));
+    }
+    if (node && typeof node === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        const envBase = SECRET_FIELD_ENV_NAME[k];
+        if (envBase && typeof v === "string" && !isPlaceholderOrEmpty(v)) {
+          out[k] = `\${${freshName(envBase)}}`;
+          findings.push({ path: path ? `${path}.${k}` : k });
+        } else {
+          out[k] = walk(v, path ? `${path}.${k}` : k);
+        }
+      }
+      return out;
+    }
+    return node;
+  };
+
+  const redacted = walk(root, "");
+  return { json: JSON.stringify(redacted, null, 2), findings };
+}
+
 interface Props {
   json: string; // config with default ${KEY} placeholders (from secret var names)
   defaultName: string;
@@ -29,12 +138,19 @@ interface Props {
 
 export default function ExportConfigModal({ json, defaultName, onSave, onClose }: Props) {
   const t = useT();
-  const detected = useMemo(() => requiredEnvVars(json), [json]);
+  // Redact any literal secret we can find BEFORE anything else runs off of
+  // `json` — the "self-contained" check and the ${VAR} list both need to see
+  // the redacted text, not the raw config that may still hold plain-text
+  // credentials (see redactLiteralSecrets above for why this can't just be a
+  // warning: Basic auth in particular has no other self-contained fix).
+  const { json: safeJson, findings } = useMemo(() => redactLiteralSecrets(json), [json]);
+  const hasLiteralSecrets = findings.length > 0;
+  const detected = useMemo(() => requiredEnvVars(safeJson), [safeJson]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const finalJson = useMemo(() => applyRenames(json, renames), [json, renames]);
+  const finalJson = useMemo(() => applyRenames(safeJson, renames), [safeJson, renames]);
   const vars = useMemo(() => requiredEnvVars(finalJson), [finalJson]);
 
   const secretYaml =
@@ -72,6 +188,13 @@ export default function ExportConfigModal({ json, defaultName, onSave, onClose }
             </div>
           ) : (
             <>
+              {hasLiteralSecrets && (
+                <div className="lt-hint" style={{ marginBottom: 10, color: "var(--yellow)" }}>
+                  {t(
+                    "This config held secrets in plain text (a literal password, token, key or credential — not a ${VAR} placeholder). They were rewritten to ${VAR} below; set those environment variables before the run and never commit the original values."
+                  )}
+                </div>
+              )}
               <div className="lt-hint" style={{ marginBottom: 10 }}>
                 {t("Secrets are written as ${NAME} placeholders — set these environment variables in your cluster before the run. Rename them here if you like; the file updates to match.")}
               </div>

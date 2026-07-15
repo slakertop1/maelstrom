@@ -43,7 +43,9 @@ export default function StreamsPanel(p: Props) {
   const reqName = (id: string) => httpRequests.find((r) => r.id === id)?.name ?? t("(deleted)");
 
   const [duration, setDuration] = useState(30);
-  const [timeout, setTimeout] = useState(10000);
+  // timeoutMs/setTimeoutMs, not timeout/setTimeout — avoids shadowing the
+  // global window.setTimeout. See pa4.
+  const [timeoutMs, setTimeoutMs] = useState(10000);
   const [streams, setStreams] = useState<UiStream[]>([]);
 
   const patchStream = (id: string, patch: Partial<UiStream>) =>
@@ -84,7 +86,7 @@ export default function StreamsPanel(p: Props) {
   const missing = p.missingVars(runnable);
 
   const start = () =>
-    p.onStart({ durationSecs: duration, timeoutMs: timeout, streams: runnable });
+    p.onStart({ durationSecs: duration, timeoutMs, streams: runnable });
 
   return (
     <div className="scenario-overlay">
@@ -117,8 +119,8 @@ export default function StreamsPanel(p: Props) {
                 <input
                   type="number"
                   min={100}
-                  value={timeout}
-                  onChange={(e) => setTimeout(+e.target.value || 10000)}
+                  value={timeoutMs}
+                  onChange={(e) => setTimeoutMs(+e.target.value || 10000)}
                 />
               </div>
               <div className="scenario-toolbar-spacer" />

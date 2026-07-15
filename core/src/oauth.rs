@@ -41,17 +41,22 @@ pub async fn post_token(
         .map_err(|e| format!("Запрос токена не удался: {}", crate::error_chain(&e)))?;
     let status = resp.status();
     let text = resp.text().await.map_err(|e| e.to_string())?;
+    // Never echo the raw response body: token-endpoint error/parse-failure
+    // bodies can contain an echoed client_secret, refresh_token or password
+    // (some providers reflect the request back), and this message ends up in
+    // logs. Surface only the status code and body length.
     if !status.is_success() {
         return Err(format!(
-            "Сервер токенов вернул {}: {}",
+            "Сервер токенов вернул {} (тело ответа скрыто, {} байт)",
             status.as_u16(),
-            text.chars().take(400).collect::<String>()
+            text.len()
         ));
     }
     let raw: RawTokenResponse = serde_json::from_str(&text).map_err(|_| {
         format!(
-            "Не удалось разобрать ответ сервера токенов: {}",
-            text.chars().take(400).collect::<String>()
+            "Не удалось разобрать ответ сервера токенов (статус {}, {} байт)",
+            status.as_u16(),
+            text.len()
         )
     })?;
     Ok(OAuthTokenResponse {
@@ -131,6 +136,10 @@ pub async fn start_token_refresher(
         // (ttl=5 for a quick retry) a success without expires_in must restore
         // it, not keep hammering the token endpoint every 4 seconds.
         let mut good_ttl = ttl;
+        // Capped exponential backoff for consecutive refresh failures: 5s,
+        // 10s, 20s, ... up to 300s, so a token-endpoint outage doesn't get
+        // hammered at a fixed 5s interval. Reset to 5s after any success.
+        let mut fail_backoff: u64 = 5;
         loop {
             let wait = (ttl as f64 * 0.8).max(0.5);
             tokio::select! {
@@ -148,10 +157,20 @@ pub async fn start_token_refresher(
                     }
                     ttl = r.expires_in.unwrap_or(good_ttl);
                     good_ttl = ttl;
+                    fail_backoff = 5;
                     count += 1;
                     on_refresh(count);
                 }
-                Err(_) => ttl = 5,
+                Err(e) => {
+                    // fetch_token's error text is already stripped of any
+                    // raw response body (see post_token), so it's safe to
+                    // log as-is.
+                    eprintln!(
+                        "[oauth] фоновое обновление токена не удалось, повтор через {fail_backoff}с: {e}"
+                    );
+                    ttl = fail_backoff;
+                    fail_backoff = (fail_backoff * 2).min(300);
+                }
             }
         }
     });

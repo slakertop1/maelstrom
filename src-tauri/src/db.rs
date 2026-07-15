@@ -23,9 +23,49 @@ pub async fn resolve_db_datasets(
     Ok(out)
 }
 
-/// Collapse a SQL string to a single truncated line for logging.
+/// Replace single-quoted SQL string literals with a fixed placeholder so
+/// query parameter values (passwords, PII, tokens embedded in ad-hoc SQL)
+/// never reach the app log — only the query's *shape* is kept.
+fn mask_sql_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+            continue;
+        }
+        out.push_str("'***'");
+        // Skip past the literal's contents, treating '' as an escaped quote
+        // (ANSI SQL) and \<char> as an escaped character (MySQL-style
+        // backslash escaping), so a backslash-escaped quote inside the
+        // literal is never mistaken for the closing quote — that mistake
+        // would end the masked span early and leak the rest of the literal
+        // (and misalign every literal boundary after it) into the log.
+        loop {
+            match chars.next() {
+                None => break,
+                Some('\\') => {
+                    // Consume whatever follows the backslash unconditionally
+                    // (including a quote) — it can't be the closing quote.
+                    chars.next();
+                }
+                Some('\'') if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                }
+                Some('\'') => break,
+                Some(_) => {}
+            }
+        }
+    }
+    out
+}
+
+/// Collapse a SQL string to a single truncated line for logging, with string
+/// literals masked so secrets/PII passed as query parameters never end up in
+/// the log file.
 fn one_line(sql: &str) -> String {
-    let s: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let masked = mask_sql_literals(sql);
+    let s: String = masked.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.chars().count() > 200 {
         format!("{}…", s.chars().take(200).collect::<String>())
     } else {
@@ -228,5 +268,61 @@ async fn db_worker(
         if status == 0 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_sql_literals_hides_password_values() {
+        let sql = "SELECT * FROM users WHERE email='a@b.com' AND password='hunter2'";
+        let masked = mask_sql_literals(sql);
+        assert!(!masked.contains("hunter2"));
+        assert!(!masked.contains("a@b.com"));
+        assert_eq!(
+            masked,
+            "SELECT * FROM users WHERE email='***' AND password='***'"
+        );
+    }
+
+    #[test]
+    fn mask_sql_literals_handles_escaped_quotes_inside_a_literal() {
+        // SQL escapes a literal single quote as ''.
+        let sql = "INSERT INTO t (name) VALUES ('O''Brien')";
+        let masked = mask_sql_literals(sql);
+        assert!(!masked.contains("O'Brien"));
+        assert_eq!(masked, "INSERT INTO t (name) VALUES ('***')");
+    }
+
+    #[test]
+    fn mask_sql_literals_handles_backslash_escaped_quotes_inside_a_literal() {
+        // MySQL-style escaping: a backslash escapes the following character,
+        // including a quote, so this is a single literal containing
+        // `pa'ssw0rd`, not a literal that closes at the escaped quote.
+        let sql = r"SELECT * FROM users WHERE password='pa\'ssw0rd' AND id=1";
+        let masked = mask_sql_literals(sql);
+        assert!(!masked.contains("ssw0rd"), "leaked: {masked}");
+        assert_eq!(masked, "SELECT * FROM users WHERE password='***' AND id=1");
+    }
+
+    #[test]
+    fn mask_sql_literals_leaves_unquoted_sql_untouched() {
+        let sql = "UPDATE t SET n = n + 1 WHERE id = 5";
+        assert_eq!(mask_sql_literals(sql), sql);
+    }
+
+    #[test]
+    fn one_line_masks_and_truncates() {
+        let sql = format!(
+            "SELECT * FROM t WHERE secret = 'top-secret-value' AND id = 1 {}",
+            "x".repeat(300)
+        );
+        let out = one_line(&sql);
+        assert!(!out.contains("top-secret-value"));
+        assert!(out.contains("'***'"));
+        assert!(out.chars().count() <= 201, "expected truncation to ~200 chars + ellipsis");
+        assert!(out.ends_with('…'));
     }
 }

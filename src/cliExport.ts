@@ -48,6 +48,21 @@ export const HTTP_TARGET_DEFAULT_RPS = 100;
 const rpsLimitOrNull = (lt: LoadCfg): number | null =>
   lt.rpsLimit === "" ? null : lt.rpsLimit;
 
+/// The HTTP target's rps must be a finite positive number or the engine drops
+/// the target outright (dead scenario). `""` (unset) already falls back to
+/// the default; an explicit 0/negative/NaN limit — e.g. a stray value left in
+/// the Load tab, or a manually edited config — has to fall back too, not be
+/// passed through verbatim.
+function httpTargetRps(lt: LoadCfg): number {
+  const n = lt.rpsLimit;
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : HTTP_TARGET_DEFAULT_RPS;
+}
+
+/// Default error-rate gate (percent, matching LoadTestResult.error_rate's
+/// 0–100 scale): tight enough to actually catch a broken run, loose enough
+/// not to fail on ordinary noise. Full UI configurability is a follow-up.
+const DEFAULT_MAX_ERROR_RATE_PCT = 5.0;
+
 const head = (name: string, lt: LoadCfg) => ({
   name,
   duration_secs: lt.durationSecs,
@@ -64,7 +79,7 @@ export function buildHttpScenario(name: string, lt: LoadCfg, t: HttpTarget) {
         url: t.url,
         headers: t.headers,
         body: t.body,
-        rps: lt.rpsLimit === "" ? HTTP_TARGET_DEFAULT_RPS : lt.rpsLimit,
+        rps: httpTargetRps(lt),
         tls: t.tls,
         auth_refresh: t.authRefresh,
         multipart: t.multipart,
@@ -72,7 +87,7 @@ export function buildHttpScenario(name: string, lt: LoadCfg, t: HttpTarget) {
     ],
     datasets: t.datasets,
     file_pools: t.filePools,
-    thresholds: { max_error_rate: 1.0, max_p95_ms: 500 },
+    thresholds: { max_error_rate: DEFAULT_MAX_ERROR_RATE_PCT, max_p95_ms: 500 },
   };
 }
 

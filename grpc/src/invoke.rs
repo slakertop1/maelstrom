@@ -19,6 +19,32 @@ fn status_msg(s: &tonic::Status) -> String {
     format!("{:?}: {}", s.code(), s.message())
 }
 
+/// A failed call: a human-readable message (for logs/UI) plus the real gRPC
+/// status code when the failure came from a `tonic::Status`. Non-gRPC
+/// failures (connect errors, bad paths, local validation) carry no code.
+/// `grpc_load` uses `code` to bucket load-test results by actual status
+/// instead of a collapsed success/failure bool.
+struct CallError {
+    message: String,
+    code: Option<tonic::Code>,
+}
+
+impl CallError {
+    fn from_status(s: &tonic::Status) -> Self {
+        CallError { message: status_msg(s), code: Some(s.code()) }
+    }
+
+    fn other(message: String) -> Self {
+        CallError { message, code: None }
+    }
+}
+
+impl From<CallError> for String {
+    fn from(e: CallError) -> String {
+        e.message
+    }
+}
+
 /// Parse proto3 JSON into a message of the given type.
 pub fn json_to_message(desc: &MessageDescriptor, json: &str) -> Result<DynamicMessage, String> {
     let json = if json.trim().is_empty() { "{}" } else { json };
@@ -72,14 +98,14 @@ async fn do_unary(
     path: &str,
     input: DynamicMessage,
     output: MessageDescriptor,
-) -> Result<DynamicMessage, String> {
+) -> Result<DynamicMessage, CallError> {
     let mut grpc = tonic::client::Grpc::new(channel);
-    grpc.ready().await.map_err(|e| format!("сервис не готов: {e}"))?;
-    let path = PathAndQuery::from_str(path).map_err(|e| format!("путь метода: {e}"))?;
+    grpc.ready().await.map_err(|e| CallError::other(format!("сервис не готов: {e}")))?;
+    let path = PathAndQuery::from_str(path).map_err(|e| CallError::other(format!("путь метода: {e}")))?;
     let resp = grpc
         .unary(tonic::Request::new(input), path, DynCodec { output })
         .await
-        .map_err(|e| status_msg(&e))?;
+        .map_err(|e| CallError::from_status(&e))?;
     Ok(resp.into_inner())
 }
 
@@ -89,17 +115,17 @@ async fn do_server_streaming(
     input: DynamicMessage,
     output: MessageDescriptor,
     max: usize,
-) -> Result<Vec<DynamicMessage>, String> {
+) -> Result<Vec<DynamicMessage>, CallError> {
     let mut grpc = tonic::client::Grpc::new(channel);
-    grpc.ready().await.map_err(|e| format!("сервис не готов: {e}"))?;
-    let path = PathAndQuery::from_str(path).map_err(|e| format!("путь метода: {e}"))?;
+    grpc.ready().await.map_err(|e| CallError::other(format!("сервис не готов: {e}")))?;
+    let path = PathAndQuery::from_str(path).map_err(|e| CallError::other(format!("путь метода: {e}")))?;
     let mut stream = grpc
         .server_streaming(tonic::Request::new(input), path, DynCodec { output })
         .await
-        .map_err(|e| status_msg(&e))?
+        .map_err(|e| CallError::from_status(&e))?
         .into_inner();
     let mut out = Vec::new();
-    while let Some(msg) = stream.message().await.map_err(|e| status_msg(&e))? {
+    while let Some(msg) = stream.message().await.map_err(|e| CallError::from_status(&e))? {
         out.push(msg);
         if out.len() >= max {
             break;
@@ -113,15 +139,15 @@ async fn do_client_streaming(
     path: &str,
     inputs: Vec<DynamicMessage>,
     output: MessageDescriptor,
-) -> Result<DynamicMessage, String> {
+) -> Result<DynamicMessage, CallError> {
     let mut grpc = tonic::client::Grpc::new(channel);
-    grpc.ready().await.map_err(|e| format!("сервис не готов: {e}"))?;
-    let path = PathAndQuery::from_str(path).map_err(|e| format!("путь метода: {e}"))?;
+    grpc.ready().await.map_err(|e| CallError::other(format!("сервис не готов: {e}")))?;
+    let path = PathAndQuery::from_str(path).map_err(|e| CallError::other(format!("путь метода: {e}")))?;
     let req = tonic::Request::new(futures_util::stream::iter(inputs));
     let resp = grpc
         .client_streaming(req, path, DynCodec { output })
         .await
-        .map_err(|e| status_msg(&e))?;
+        .map_err(|e| CallError::from_status(&e))?;
     Ok(resp.into_inner())
 }
 
@@ -131,18 +157,18 @@ async fn do_bidi_streaming(
     inputs: Vec<DynamicMessage>,
     output: MessageDescriptor,
     max: usize,
-) -> Result<Vec<DynamicMessage>, String> {
+) -> Result<Vec<DynamicMessage>, CallError> {
     let mut grpc = tonic::client::Grpc::new(channel);
-    grpc.ready().await.map_err(|e| format!("сервис не готов: {e}"))?;
-    let path = PathAndQuery::from_str(path).map_err(|e| format!("путь метода: {e}"))?;
+    grpc.ready().await.map_err(|e| CallError::other(format!("сервис не готов: {e}")))?;
+    let path = PathAndQuery::from_str(path).map_err(|e| CallError::other(format!("путь метода: {e}")))?;
     let req = tonic::Request::new(futures_util::stream::iter(inputs));
     let mut stream = grpc
         .streaming(req, path, DynCodec { output })
         .await
-        .map_err(|e| status_msg(&e))?
+        .map_err(|e| CallError::from_status(&e))?
         .into_inner();
     let mut out = Vec::new();
-    while let Some(msg) = stream.message().await.map_err(|e| status_msg(&e))? {
+    while let Some(msg) = stream.message().await.map_err(|e| CallError::from_status(&e))? {
         out.push(msg);
         if out.len() >= max {
             break;
@@ -156,16 +182,24 @@ async fn execute_call(
     channel: Channel,
     call: &LoadCall,
     max: usize,
-) -> Result<Vec<DynamicMessage>, String> {
+) -> Result<Vec<DynamicMessage>, CallError> {
     let path = &call.path;
     let out = call.output.clone();
     match (call.client_streaming, call.server_streaming) {
         (false, false) => {
-            let input = call.inputs.first().cloned().ok_or("Пустое тело запроса")?;
+            let input = call
+                .inputs
+                .first()
+                .cloned()
+                .ok_or_else(|| CallError::other("Пустое тело запроса".to_string()))?;
             Ok(vec![do_unary(channel, path, input, out).await?])
         }
         (false, true) => {
-            let input = call.inputs.first().cloned().ok_or("Пустое тело запроса")?;
+            let input = call
+                .inputs
+                .first()
+                .cloned()
+                .ok_or_else(|| CallError::other("Пустое тело запроса".to_string()))?;
             do_server_streaming(channel, path, input, out, max).await
         }
         (true, false) => Ok(vec![
@@ -296,7 +330,13 @@ pub async fn grpc_load(
 
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(duration_secs);
-    let (tx, rx) = mpsc::unbounded_channel::<(u64, bool)>();
+    // Second element is a status code for the aggregated status breakdown,
+    // not a bool: 200 on success, a real gRPC status code (1..=16) on
+    // failure. NOT tonic::Code::Ok's raw discriminant (0) — status_label()
+    // treats 0 as the HTTP-runner's "network error" sentinel for non-DB
+    // runners, so reusing it for gRPC success would mislabel every
+    // successful call as an error in the CLI/HTML report and UI.
+    let (tx, rx) = mpsc::unbounded_channel::<(u64, u16)>();
     let call = Arc::new(call);
 
     for _ in 0..vus {
@@ -319,9 +359,20 @@ pub async fn grpc_load(
                     }
                 }
                 let start = Instant::now();
-                let ok = execute_call(channel.clone(), &call, usize::MAX).await.is_ok();
+                let outcome = execute_call(channel.clone(), &call, usize::MAX).await;
+                let ok = outcome.is_ok();
+                // 200 on success (the HTTP-report convention status_label()
+                // renders as a real code, keeping 0 free for "network
+                // error"); the real gRPC status code (1..=16) from a
+                // tonic::Status on failure; fall back to Unknown for
+                // non-gRPC failures (e.g. connect errors) so they still
+                // land in the error bucket without colliding with 0/200.
+                let code: u16 = match &outcome {
+                    Ok(_) => 200,
+                    Err(e) => e.code.map(|c| c as u16).unwrap_or(tonic::Code::Unknown as u16),
+                };
                 let latency_us = start.elapsed().as_micros().max(1) as u64;
-                if tx.send((latency_us, ok)).is_err() {
+                if tx.send((latency_us, code)).is_err() {
                     break;
                 }
                 if !ok {
@@ -346,7 +397,7 @@ pub async fn grpc_load(
 }
 
 async fn aggregate(
-    mut rx: mpsc::UnboundedReceiver<(u64, bool)>,
+    mut rx: mpsc::UnboundedReceiver<(u64, u16)>,
     meta: RunMeta,
     started: Instant,
 ) -> LoadTestResult {
@@ -365,15 +416,18 @@ async fn aggregate(
     loop {
         tokio::select! {
             s = rx.recv() => match s {
-                Some((latency_us, ok)) => {
+                Some((latency_us, code)) => {
                     total += 1;
                     sum_us += latency_us as u128;
                     sec_req += 1;
                     sec_sum += latency_us as u128;
                     let _ = hist.record(latency_us);
                     let _ = sec_hist.record(latency_us);
-                    let code: u16 = if ok { 200 } else { 0 };
                     *status.entry(code).or_insert(0) += 1;
+                    // 200 == success (see the mapping above); everything
+                    // else (real gRPC 1..=16, or Unknown for non-gRPC
+                    // failures) counts as an error.
+                    let ok = code == 200;
                     if !ok { errors += 1; sec_err += 1; }
                 }
                 None => break,

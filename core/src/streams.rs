@@ -129,33 +129,41 @@ pub async fn run_streams(
                 _ => None,
             };
 
-            let needs_headers = st.extract.iter().any(|e| e.from == "header");
-            let needs_body = st.extract.iter().any(|e| e.from != "header");
+            let needs_headers =
+                st.extract.iter().any(|e| e.from.trim().eq_ignore_ascii_case("header"));
+            let needs_body =
+                st.extract.iter().any(|e| !e.from.trim().eq_ignore_ascii_case("header"));
 
             // Compile each regex extract rule once, up front. A bad pattern is
             // logged here (not silently unset on every request) and disables
-            // just that rule.
-            let extract: Vec<PreparedExtract> = st
-                .extract
-                .iter()
-                .map(|r| {
-                    let regex = if r.from == "regex" {
-                        match regex::Regex::new(&r.expr) {
-                            Ok(re) => Some(re),
-                            Err(e) => {
-                                log(format!(
-                                    "⚠ поток «{}»/«{}»: неверное regex-правило «{}»: {e}",
-                                    s.name, st.name, r.name
-                                ));
-                                None
-                            }
+            // just that rule. `from` is normalized (trim/lowercase) and
+            // validated here too — an unknown source used to compare
+            // case-sensitively and then fall silently into the JSON-path
+            // branch of `extract_value`, so a typo (or "Header") quietly
+            // corrupted a chain instead of failing the run up front.
+            let mut extract: Vec<PreparedExtract> = Vec::with_capacity(st.extract.len());
+            for r in &st.extract {
+                let norm_from = normalize_extract_from(&r.from).map_err(|e| {
+                    log_err(format!("Поток «{}»/«{}»/«{}»: {e}", s.name, st.name, r.name))
+                })?;
+                let regex = if norm_from == "regex" {
+                    match regex::Regex::new(&r.expr) {
+                        Ok(re) => Some(re),
+                        Err(e) => {
+                            log(format!(
+                                "⚠ поток «{}»/«{}»: неверное regex-правило «{}»: {e}",
+                                s.name, st.name, r.name
+                            ));
+                            None
                         }
-                    } else {
-                        None
-                    };
-                    PreparedExtract { rule: r.clone(), regex }
-                })
-                .collect();
+                    }
+                } else {
+                    None
+                };
+                let mut rule = r.clone();
+                rule.from = norm_from;
+                extract.push(PreparedExtract { rule, regex });
+            }
 
             steps.push(PreparedStep {
                 client,
@@ -254,12 +262,12 @@ async fn stream_dispatcher(
     dyn_state: Arc<DynState>,
     dropped: Arc<AtomicU64>,
 ) {
-    let per_tick = rps as f64 / 20.0;
     // Cap in-flight ITERATIONS at ~2s of arrivals so a slow chain doesn't grow
     // memory without bound; excess arrivals are counted as dropped.
     let cap = ((rps as usize) * 2).clamp(50, 20_000);
     let inflight = Arc::new(AtomicUsize::new(0));
-    let mut acc = 0.0_f64;
+    let started = tokio::time::Instant::now();
+    let mut generated: u64 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -270,12 +278,19 @@ async fn stream_dispatcher(
             _ = tokio::time::sleep_until(deadline) => break,
             _ = interval.tick() => {}
         }
-        acc += per_tick;
-        let mut n = acc.floor() as usize;
-        acc -= n as f64;
+        // Target arrivals come from wall-clock elapsed time, not from counting
+        // realized `interval.tick()` events: under load, MissedTickBehavior::
+        // Skip silently drops missed ticks, and a per-tick fixed increment
+        // would lose that time's worth of iterations with no trace anywhere.
+        // Basing it on elapsed time means a late/skipped tick still catches up
+        // to the correct cumulative total; any of that catch-up the inflight
+        // cap can't absorb is counted as dropped below, same as before.
+        let target_total = (started.elapsed().as_secs_f64() * rps as f64).floor() as u64;
+        let mut n = target_total.saturating_sub(generated);
+        generated = target_total;
         while n > 0 {
             if inflight.load(Ordering::Relaxed) >= cap {
-                dropped.fetch_add(n as u64, Ordering::Relaxed);
+                dropped.fetch_add(n, Ordering::Relaxed);
                 break;
             }
             inflight.fetch_add(1, Ordering::Relaxed);
@@ -283,8 +298,9 @@ async fn stream_dispatcher(
             let tx = tx.clone();
             let inflight = inflight.clone();
             let dyn_state = dyn_state.clone();
+            let cancel = token.clone();
             tokio::spawn(async move {
-                run_iteration(stream_idx, &steps, &tx, &dyn_state).await;
+                run_iteration(stream_idx, &steps, &tx, &dyn_state, &cancel).await;
                 inflight.fetch_sub(1, Ordering::Relaxed);
             });
             n -= 1;
@@ -293,19 +309,27 @@ async fn stream_dispatcher(
 }
 
 /// Run one chain iteration: steps in order, threading extracted `{{vars}}`.
-/// Aborts remaining steps on the first failure (network error / status ≥ 400).
+/// Aborts remaining steps on the first failure (network error / status ≥ 400)
+/// or as soon as `cancel` fires — checked between steps AND inside the wait
+/// for each step's response, so a chain in flight when Stop is hit doesn't
+/// keep running to completion (or worse, hang on a slow/dead target).
 async fn run_iteration(
     stream_idx: usize,
     steps: &[PreparedStep],
     tx: &mpsc::UnboundedSender<Sample>,
     dyn_state: &DynState,
+    cancel: &CancellationToken,
 ) {
     let iter_start = Instant::now();
     let mut vars: HashMap<String, String> = HashMap::new();
     let mut ok = true;
     for (i, step) in steps.iter().enumerate() {
+        if cancel.is_cancelled() {
+            ok = false;
+            break;
+        }
         let start = Instant::now();
-        let (status, body, headers) = send_step(step, &vars, dyn_state).await;
+        let (status, body, headers) = send_step(step, &vars, dyn_state, cancel).await;
         let latency_us = start.elapsed().as_micros().max(1) as u64;
         let _ = tx.send(Sample::Step { stream: stream_idx, step: i, latency_us, status });
         if status == 0 || status >= 400 {
@@ -324,11 +348,14 @@ async fn run_iteration(
 
 /// Build and send one step. Substitutes chain `{{vars}}` first, then the dynval
 /// generators (`{{$...}}`). Returns (status, body?, headers) — body/headers only
-/// read when this step has an extract rule that needs them.
+/// read when this step has an extract rule that needs them. Races the request
+/// against `cancel` so a step in flight when Stop is hit doesn't block the
+/// chain from unwinding until the request itself times out.
 async fn send_step(
     step: &PreparedStep,
     vars: &HashMap<String, String>,
     dyn_state: &DynState,
+    cancel: &CancellationToken,
 ) -> (u16, Option<String>, Vec<(String, String)>) {
     // Build the request inside a block so the per-request context (which holds a
     // !Sync RefCell) is dropped BEFORE the await below — keeps this future Send.
@@ -352,7 +379,12 @@ async fn send_step(
         }
         req
     };
-    match req.send().await {
+    let sent = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return (0, None, Vec::new()),
+        r = req.send() => r,
+    };
+    match sent {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let headers = if step.needs_headers {
@@ -372,6 +404,17 @@ async fn send_step(
             (status, body, headers)
         }
         Err(_) => (0, None, Vec::new()),
+    }
+}
+
+/// Normalize an extract rule's `from` (trim + lowercase, so "Header"/" json "
+/// behave like "header"/"json") and check it's one of the supported sources.
+fn normalize_extract_from(from: &str) -> Result<String, String> {
+    let norm = from.trim().to_lowercase();
+    if matches!(norm.as_str(), "header" | "regex" | "json") {
+        Ok(norm)
+    } else {
+        Err(format!("неверный источник extract «{from}» (ожидается header/regex/json)"))
     }
 }
 
@@ -404,7 +447,15 @@ fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json:
     let mut cur = v;
     for part in norm.split('.').filter(|p| !p.is_empty()) {
         cur = match part.parse::<usize>() {
-            Ok(idx) => cur.get(idx)?,
+            // A numeric segment usually means an array index, but the same
+            // response shape can carry an OBJECT with numeric-looking string
+            // keys (e.g. {"2024": {...}}) — those were unreachable before
+            // since the array-index branch's `?` bailed the whole lookup on
+            // any object. Fall back to a plain string-key lookup instead.
+            Ok(idx) => match cur.get(idx) {
+                Some(v) => v,
+                None => cur.get(part)?,
+            },
             Err(_) => cur.get(part)?,
         };
     }
@@ -690,5 +741,75 @@ mod tests {
         assert_eq!(json_path(&v, "nul").map(json_scalar), Some(String::new()));
         // out-of-range index → None
         assert!(json_path(&v, "arr.5").is_none());
+    }
+
+    // s4 regression: a numeric path segment must fall back to an object's
+    // string key when it isn't a valid array index — {"2024": ...} used to be
+    // unreachable because the array-index branch always won and bailed via `?`.
+    #[test]
+    fn json_path_numeric_segment_falls_back_to_object_key() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"2024":{"total":42},"data":[{"id":"A"},{"id":"B"}],"0":"root-zero"}"#,
+        )
+        .unwrap();
+        // numeric-looking object key, nested
+        assert_eq!(json_path(&v, "2024.total").map(json_scalar), Some("42".to_string()));
+        // numeric-looking object key at the root
+        assert_eq!(json_path(&v, "0").map(json_scalar), Some("root-zero".to_string()));
+        // real array indices still resolve as indices, not as string keys
+        assert_eq!(json_path(&v, "data.0.id").map(json_scalar), Some("A".to_string()));
+        assert_eq!(json_path(&v, "data[1].id").map(json_scalar), Some("B".to_string()));
+    }
+
+    // s2 regression: `from` is normalized (trim/lowercase) and restricted to
+    // header/regex/json — a typo must be rejected, not silently treated as json.
+    #[test]
+    fn extract_from_normalizes_case_and_whitespace() {
+        assert_eq!(normalize_extract_from(" JSON ").unwrap(), "json");
+        assert_eq!(normalize_extract_from("Header").unwrap(), "header");
+        assert_eq!(normalize_extract_from("REGEX").unwrap(), "regex");
+    }
+
+    #[test]
+    fn extract_from_rejects_unknown_source() {
+        let err = normalize_extract_from("xml").unwrap_err();
+        assert!(err.contains("xml"), "{err}");
+        assert!(normalize_extract_from("").is_err());
+    }
+
+    #[tokio::test]
+    async fn run_streams_rejects_unknown_extract_from_up_front() {
+        let bad_step = StreamStep {
+            name: "s".into(),
+            method: "GET".into(),
+            url: "http://127.0.0.1:1/x".into(),
+            headers: vec![],
+            body: None,
+            tls: None,
+            multipart: None,
+            extract: vec![ExtractRule { name: "v".into(), from: "xml".into(), expr: "a".into() }],
+        };
+        let spec = StreamScenarioSpec {
+            duration_secs: 1,
+            timeout_ms: 500,
+            streams: vec![StreamSpec { name: "s".into(), rps: 1, steps: vec![bad_step] }],
+            datasets: vec![],
+            file_pools: vec![],
+        };
+        // Must fail at build time — before any dispatch against the (bogus)
+        // target — so this returns immediately instead of running for 1s.
+        // (StreamsResult isn't Debug, so match manually instead of unwrap_err.)
+        let result = run_streams(
+            spec,
+            CancellationToken::new(),
+            Arc::new(|_: &StreamsProgress| {}),
+            Arc::new(|_: String| {}),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected run_streams to reject an unknown extract `from`"),
+        };
+        assert!(err.contains("xml"), "{err}");
     }
 }

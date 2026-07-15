@@ -3,7 +3,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, act, cleanup, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { HttpResponseData, LoadTestResult } from "./types";
+import type { HttpResponseData, LoadTestResult, ScenarioResult } from "./types";
 
 // Shared, hoisted state the mocks and the test both reach.
 const h = vi.hoisted(() => ({
@@ -40,13 +40,26 @@ const fakeResponse: HttpResponseData = {
   duration_ms: 42,
 };
 
+// Backend wall-clock format ("YYYY-MM-DD HH:MM:SS", LOCAL time — matches
+// Rust's `chrono::Local::now()`), always "now" — a1's staleness check
+// compares this against when the frontend started tracking the run, so a
+// hardcoded date would eventually look artificially stale.
+function nowStamp(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  );
+}
+
 const fakeLoadResult: LoadTestResult = {
   url: "https://api.example.com",
   method: "GET",
   vus: 20,
   duration_secs: 30,
   rps_limit: null,
-  started_at: "2026-07-04 15:00:00",
+  started_at: nowStamp(),
   actual_duration_ms: 30000,
   total_requests: 12345,
   errors: 0,
@@ -253,7 +266,11 @@ describe("full flow: compose request → send → load test", () => {
       max_ms: 300,
       point: fakeLoadResult.timeline[0],
     });
-    emit("load_finished", fakeLoadResult);
+    // `started_at` is overridden to "now" here (not the module-load-time
+    // value baked into fakeLoadResult) — a1's staleness check compares it
+    // against when this run started tracking, and enough real time may have
+    // elapsed since the test file was imported to otherwise trip it.
+    emit("load_finished", { ...fakeLoadResult, started_at: nowStamp() });
 
     // The finished banner appears, then the aggregate numbers (total requests
     // and the 200-status count both render as "12.3k").
@@ -395,5 +412,151 @@ describe("full flow: compose request → send → load test", () => {
     // …and come back: the edit must have been auto-saved, not reset.
     await user.click(screen.getByText(/Example: JSON API/));
     await waitFor(() => expect(url.value).toBe("https://api.example.com/EDITED"));
+  });
+
+  it("a1: a stale scenario_finished from an abandoned run does not clobber a freshly started one", async () => {
+    const invoke = vi.fn(async (cmd: string) => {
+      if (cmd === "load_state") return "";
+      if (cmd === "start_scenario_load_test") return undefined;
+      return undefined;
+    });
+    h.invoke = invoke as any;
+    const user = userEvent.setup();
+
+    render(<App />);
+    await screen.findByPlaceholderText(/api\.example\.com/i);
+
+    // Open the service load test panel and start a run.
+    await user.click(screen.getByTitle(/Load-test service/));
+    await user.click(screen.getByRole("button", { name: /Select all/ }));
+    await user.click(screen.getByRole("button", { name: /Run load test/ }));
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith("start_scenario_load_test", expect.anything());
+    });
+    await screen.findByText(/Load running/);
+
+    // Close WITHOUT the run ever finishing — the backend's cancel is
+    // fire-and-forget, so THIS run's scenario_finished can still arrive later.
+    await user.click(screen.getByTitle("Close"));
+
+    // Reopen and start a brand-new run.
+    await user.click(screen.getByTitle(/Load-test service/));
+    await user.click(screen.getByRole("button", { name: /Select all/ }));
+    await user.click(screen.getByRole("button", { name: /Run load test/ }));
+    await screen.findByText(/Load running/);
+
+    // The OLD (abandoned) run's result arrives late — it must not be
+    // displayed as if it were the new run's.
+    const staleResult: ScenarioResult = {
+      started_at: "2020-01-01 00:00:00",
+      duration_secs: 30,
+      actual_duration_ms: 30000,
+      overall: fakeLoadResult,
+      targets: [fakeLoadResult],
+      stopped_early: true,
+    };
+    emit("scenario_finished", staleResult);
+
+    // Still tracking the NEW run: the live view is still up, no finished
+    // banner appeared.
+    expect(screen.queryByText(/Load running/)).toBeInTheDocument();
+    expect(screen.queryByText(/✔ Load test finished/)).toBeNull();
+    expect(screen.queryByText(/✖ Finished with errors/)).toBeNull();
+
+    // The new run's OWN completion is still applied correctly afterwards.
+    const freshResult: ScenarioResult = {
+      started_at: nowStamp(),
+      duration_secs: 30,
+      actual_duration_ms: 30000,
+      overall: fakeLoadResult,
+      targets: [fakeLoadResult],
+      stopped_early: false,
+    };
+    emit("scenario_finished", freshResult);
+    await screen.findByText(/✔ Load test finished/);
+  });
+
+  it("a2: switching requests mid-send does not leave the Send button stuck disabled", async () => {
+    // Request A's ("Example: JSON API") response hangs until we resolve it —
+    // simulating a slow backend call the user gives up waiting on and
+    // switches away from before it completes.
+    let resolveSend!: (v: HttpResponseData) => void;
+    const sendPromise = new Promise<HttpResponseData>((res) => (resolveSend = res));
+    const invoke = vi.fn(async (cmd: string) => {
+      if (cmd === "load_state") return "";
+      if (cmd === "send_request") return sendPromise;
+      return undefined;
+    });
+    h.invoke = invoke as any;
+    const user = userEvent.setup();
+
+    render(<App />);
+    const url = (await screen.findByPlaceholderText(/api\.example\.com/i)) as HTMLInputElement;
+
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith("send_request", expect.anything());
+    });
+    // The button shows a spinner (no "Send" label) while the request is in flight.
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+
+    // Switch to a brand-new request BEFORE the response arrives, then give it
+    // its own URL so the Send button isn't disabled for an unrelated reason
+    // (an empty URL / canSend=false).
+    await user.click(screen.getByTitle(/Add request/));
+    await waitFor(() => expect(url.value).toBe(""));
+    fireEvent.change(url, { target: { value: "https://api.example.com/other" } });
+
+    // Request A's stale response now lands while a DIFFERENT request is open.
+    await act(async () => {
+      resolveSend(fakeResponse);
+    });
+
+    // The global `sending` flag must still clear — the button re-enables
+    // instead of staying disabled forever (it must not be gated on request
+    // A's id, which no longer matches the request now open).
+    const sendBtn = await screen.findByRole("button", { name: "Send" });
+    expect(sendBtn).not.toBeDisabled();
+
+    // Drain the 400ms debounced autosave triggered by the URL edit above
+    // before the test ends — otherwise it fires during a LATER test (after
+    // cleanup() unmounts this tree and the effect's flush-on-unmount runs),
+    // using whatever `h.invoke` mock happens to be active then. Wrapped in
+    // act() since the resulting saveState() resolution updates state.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 500));
+    });
+  });
+
+  it("shows the load-error banner and suppresses autosave until acknowledged", async () => {
+    const invoke = vi.fn(async (cmd: string) => {
+      if (cmd === "load_state") throw new Error("disk read failed");
+      if (cmd === "load_state_backup") throw new Error("no backup either");
+      return undefined;
+    });
+    h.invoke = invoke as any;
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    // The banner appears and defaults are shown underneath.
+    await screen.findByText(/Couldn't load your saved data/);
+    const url = (await screen.findByPlaceholderText(/api\.example\.com/i)) as HTMLInputElement;
+
+    // Editing the request would normally trigger the 400ms debounced
+    // autosave — while the load error is unacknowledged it must NOT, or a
+    // still-recoverable file could get overwritten with defaults.
+    fireEvent.change(url, { target: { value: "https://api.example.com/x" } });
+    await new Promise((r) => setTimeout(r, 600));
+    expect(invoke).not.toHaveBeenCalledWith("save_state", expect.anything());
+
+    // Acknowledging the banner lets saves resume.
+    await user.click(screen.getByRole("button", { name: "Continue with defaults" }));
+    await waitFor(
+      () => {
+        expect(invoke).toHaveBeenCalledWith("save_state", expect.anything());
+      },
+      { timeout: 2000 }
+    );
   });
 });

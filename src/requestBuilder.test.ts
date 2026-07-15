@@ -157,6 +157,39 @@ describe("buildAuthRefresh", () => {
   });
 });
 
+describe("buildRequest — excludeVarNames (chain-var collision)", () => {
+  it("bakes an Environment value by default, even when its name collides with a chain-extract name", () => {
+    const b = buildRequest(
+      req({ url: "https://api/x", headers: [{ id: "h", key: "X-Token", value: "{{token}}", enabled: true }] }),
+      env([["token", "FROM_ENV"]])
+    );
+    expect(b.headers).toContainEqual(["X-Token", "FROM_ENV"]);
+  });
+
+  it("leaves {{name}} as a placeholder when the name is passed in excludeVarNames", () => {
+    const b = buildRequest(
+      req({ url: "https://api/x", headers: [{ id: "h", key: "X-Token", value: "{{token}}", enabled: true }] }),
+      env([["token", "FROM_ENV"]]),
+      false,
+      new Set(["token"])
+    );
+    expect(b.headers).toContainEqual(["X-Token", "{{token}}"]);
+  });
+
+  it("accepts a plain array too, and only excludes the named vars", () => {
+    const b = buildRequest(
+      req({ url: "https://{{host}}/{{token}}" }),
+      env([
+        ["host", "api.example.com"],
+        ["token", "FROM_ENV"],
+      ]),
+      false,
+      ["token"]
+    );
+    expect(b.url).toBe("https://api.example.com/{{token}}");
+  });
+});
+
 describe("unresolvedVars & builtStrings", () => {
   it("flags {{env}} vars, ignores {{$generators}}, and dedups", () => {
     expect(

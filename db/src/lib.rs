@@ -72,11 +72,15 @@ impl Db {
     }
 
     /// Fetch up to `limit` preview rows as a table of strings (for the app grid).
+    /// Streams the *whole* result set so `row_count` reflects the real total
+    /// (the UI shows it as-is), but only materializes the first `limit` rows
+    /// into memory for the preview — a preview must not pull the whole result
+    /// set into memory just to show the first page.
     pub async fn fetch(&self, query: &str, limit: usize) -> Result<Table, sqlx::Error> {
         match self {
-            Db::Pg(p) => Ok(to_table(&sqlx::query(query).fetch_all(p).await?, limit, pg_cell)),
-            Db::MySql(p) => Ok(to_table(&sqlx::query(query).fetch_all(p).await?, limit, mysql_cell)),
-            Db::Sqlite(p) => Ok(to_table(&sqlx::query(query).fetch_all(p).await?, limit, sqlite_cell)),
+            Db::Pg(p) => to_table_capped(sqlx::query(query).fetch(p), limit, pg_cell).await,
+            Db::MySql(p) => to_table_capped(sqlx::query(query).fetch(p), limit, mysql_cell).await,
+            Db::Sqlite(p) => to_table_capped(sqlx::query(query).fetch(p), limit, sqlite_cell).await,
         }
     }
 
@@ -106,12 +110,18 @@ impl Db {
     }
 
     /// Run a query for the load test: only success/failure matters, rows discarded.
+    /// Drains the whole stream (without materializing rows) instead of
+    /// collecting a full `Vec` — a SELECT under load (many concurrent VUs)
+    /// must not pull a full table into memory just to confirm it succeeded,
+    /// but the latency measured around this call must reflect the time to
+    /// receive the *entire* result set, and errors surfacing partway through
+    /// the stream (e.g. a `statement_timeout`) must still be caught.
     pub async fn run_ok(&self, query: &str, is_select: bool) -> bool {
         if is_select {
             match self {
-                Db::Pg(p) => sqlx::query(query).fetch_all(p).await.is_ok(),
-                Db::MySql(p) => sqlx::query(query).fetch_all(p).await.is_ok(),
-                Db::Sqlite(p) => sqlx::query(query).fetch_all(p).await.is_ok(),
+                Db::Pg(p) => select_ok(sqlx::query(query).fetch(p)).await,
+                Db::MySql(p) => select_ok(sqlx::query(query).fetch(p)).await,
+                Db::Sqlite(p) => select_ok(sqlx::query(query).fetch(p)).await,
             }
         } else {
             self.execute(query).await.is_ok()
@@ -123,6 +133,26 @@ impl Db {
             Db::Pg(p) => p.close().await,
             Db::MySql(p) => p.close().await,
             Db::Sqlite(p) => p.close().await,
+        }
+    }
+}
+
+/// Drain an entire SELECT stream to know whether it succeeded, without
+/// materializing the result set — every row is fetched and dropped, but none
+/// are collected into a `Vec`. This must read to the end (not stop at the
+/// first row): the load test's latency measurement wraps this call, and an
+/// error can surface partway through the stream (e.g. a `statement_timeout`
+/// firing mid-transfer), not only on the first poll.
+async fn select_ok<R, S>(mut stream: S) -> bool
+where
+    R: Row,
+    S: futures_util::Stream<Item = Result<R, sqlx::Error>> + Unpin,
+{
+    loop {
+        match stream.try_next().await {
+            Ok(Some(_)) => {} // discard the row, keep draining
+            Ok(None) => return true, // end of stream: fully drained, no error
+            Err(_) => return false,
         }
     }
 }
@@ -153,23 +183,44 @@ where
     Ok((rows, truncated))
 }
 
-fn to_table<R: Row>(rows: &[R], limit: usize, cell: impl Fn(&R, usize) -> String) -> Table {
-    let columns: Vec<String> = rows
-        .first()
-        .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
-        .unwrap_or_default();
-    let truncated = rows.len() > limit;
-    let preview = rows
-        .iter()
-        .take(limit)
-        .map(|row| (0..row.columns().len()).map(|i| cell(row, i)).collect())
-        .collect();
-    Table {
-        columns,
-        rows: preview,
-        row_count: rows.len() as u64,
-        truncated,
+async fn to_table_capped<R, S>(
+    mut stream: S,
+    limit: usize,
+    cell: impl Fn(&R, usize) -> String,
+) -> Result<Table, sqlx::Error>
+where
+    R: Row,
+    S: futures_util::Stream<Item = Result<R, sqlx::Error>> + Unpin,
+{
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows = Vec::new();
+    // Counts every row in the stream, not just the ones kept in `rows` — the
+    // UI (DbResultView.tsx "rows: {row_count}", DatasetsModal) shows this as
+    // the real total, which can be larger than the preview.
+    let mut row_count: u64 = 0;
+    while let Some(row) = stream.try_next().await? {
+        // Columns come from the first row seen, even if `limit` is 0 — a
+        // preview with an empty grid should still show headers.
+        if columns.is_empty() {
+            columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+        }
+        row_count += 1;
+        // Only the first `limit` rows are materialized into the preview —
+        // everything past that is counted above and then dropped, keeping
+        // memory bounded regardless of the real total.
+        if rows.len() < limit {
+            rows.push((0..row.columns().len()).map(|i| cell(&row, i)).collect());
+        }
     }
+    // Truncated iff more rows existed than fit in the preview — exactly
+    // `limit` rows is NOT truncated (mirrors collect_capped).
+    let truncated = row_count > limit as u64;
+    Ok(Table {
+        columns,
+        rows,
+        row_count,
+        truncated,
+    })
 }
 
 // ---------- value → string per driver ----------
@@ -347,19 +398,19 @@ pub fn build_db_url(url: &str, user: &str, pass: &str) -> String {
 }
 
 /// Hide the password in a connection URL before it lands in logs / reports.
+/// Masks the whole userinfo segment (before `@`) — including a bare token
+/// with no `user:pass` split (`scheme://TOKEN@host`), which must not leak.
 pub fn mask_db_url(url: &str) -> String {
     if let Some(scheme_end) = url.find("://") {
         let rest = &url[scheme_end + 3..];
         if let Some(at) = rest.find('@') {
             let creds = &rest[..at];
-            if let Some(colon) = creds.find(':') {
-                return format!(
-                    "{}://{}:***@{}",
-                    &url[..scheme_end],
-                    &creds[..colon],
-                    &rest[at + 1..]
-                );
-            }
+            let scheme = &url[..scheme_end];
+            let host = &rest[at + 1..];
+            return match creds.find(':') {
+                Some(colon) => format!("{scheme}://{}:***@{host}", &creds[..colon]),
+                None => format!("{scheme}://***@{host}"),
+            };
         }
     }
     url.to_string()
@@ -406,10 +457,15 @@ pub async fn resolve_db_datasets(
         let db = Db::connect(&url, 1, Duration::from_secs(30))
             .await
             .map_err(|e| format!("Датасет «{}»: подключение к БД: {e}", spec.name))?;
-        let (rows, truncated) = db
-            .fetch_maps_capped(query, cap.max(1))
-            .await
-            .map_err(|e| format!("Датасет «{}»: запрос: {e}", spec.name))?;
+        // Close the pool on BOTH the success and error paths — an early `?`
+        // return must not skip it and leave the pool to close only via Drop.
+        let (rows, truncated) = match db.fetch_maps_capped(query, cap.max(1)).await {
+            Ok(v) => v,
+            Err(e) => {
+                db.close().await;
+                return Err(format!("Датасет «{}»: запрос: {e}", spec.name));
+            }
+        };
         db.close().await;
         if truncated {
             warnings.push(format!(
@@ -467,6 +523,17 @@ mod tests {
     }
 
     #[test]
+    fn masks_bare_token_without_colon_in_url() {
+        // scheme://TOKEN@host (no `user:pass` split) must still be fully masked —
+        // the token is a credential just as much as a password.
+        assert_eq!(mask_db_url("postgres://TOKEN@h:5432/db"), "postgres://***@h:5432/db");
+        assert_eq!(
+            mask_db_url("mysql://eyJhbGciOiJIUzI1NiJ9@h/db"),
+            "mysql://***@h/db"
+        );
+    }
+
+    #[test]
     fn detects_read_queries() {
         assert!(is_query("SELECT 1"));
         assert!(is_query("  with x as (..) select"));
@@ -493,6 +560,42 @@ mod tests {
         assert_eq!(table.rows[0][0], "1");
         assert_eq!(table.rows[0][3], "NULL");
         assert!(table.rows[0][4].starts_with("<binary"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_row_count_reflects_real_total_beyond_limit() {
+        // Regression check for b2: to_table_capped must count every row in the
+        // stream, not just the ones kept in the preview.
+        let db = Db::connect("sqlite::memory:", 1, Duration::from_secs(5)).await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER)").await.unwrap();
+        db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").await.unwrap();
+        let table = db.fetch("SELECT id FROM t ORDER BY id", 2).await.unwrap();
+        // row_count must be the REAL total (5) — the UI (DbResultView.tsx
+        // "rows: {row_count}", DatasetsModal) relies on this, not the
+        // truncated preview length.
+        assert_eq!(table.row_count, 5, "row_count must be the real total, not the preview length");
+        assert_eq!(table.rows.len(), 2, "preview must still be capped at `limit`");
+        assert!(table.truncated);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn select_ok_catches_error_after_first_row() {
+        // Regression check for b1: select_ok must drain the whole stream, not
+        // stop after the first poll — an error surfacing later (e.g. a
+        // statement_timeout mid-transfer) must still fail the load test.
+        let db = Db::connect("sqlite::memory:", 1, Duration::from_secs(5)).await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER)").await.unwrap();
+        db.execute("INSERT INTO t VALUES (1),(2),(3)").await.unwrap();
+        let first_row: SqliteRow = match &db {
+            Db::Sqlite(p) => sqlx::query("SELECT id FROM t ORDER BY id").fetch(p).try_next().await.unwrap().unwrap(),
+            _ => unreachable!(),
+        };
+        // Synthetic stream: a real first row (Ok), then an error — simulating
+        // a failure that only surfaces after streaming has begun.
+        let synthetic = futures_util::stream::iter(vec![Ok(first_row), Err(sqlx::Error::RowNotFound)]);
+        assert!(!select_ok(synthetic).await, "an error after the first row must still be caught");
         db.close().await;
     }
 

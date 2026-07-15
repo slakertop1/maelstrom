@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 use tauri::{AppHandle, Manager};
 
@@ -7,14 +8,39 @@ fn read_non_empty(path: &Path) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Atomically replace `file` with `data`: write a temp file, keep the previous
-/// version as `.bak`, then rename over the target. A crash mid-write can no
-/// longer destroy the existing state.
+/// state.json / .bak can hold secrets (API keys, auth tokens, DB passwords
+/// saved in requests). Lock them down to the owner only.
+#[cfg(unix)]
+fn restrict_perms(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(windows)]
+fn restrict_perms(_path: &Path) {
+    // TODO: restrict the Windows ACL to the current user (needs `icacls` or a
+    // crate like `windows-acl`; default NTFS perms already limit access to the
+    // owning account + admins under %APPDATA%, so this is a hardening gap, not
+    // an open one). Out of scope for this point fix.
+}
+
+/// Atomically replace `file` with `data`: write a temp file, fsync it so the
+/// bytes are actually on disk, keep the previous version as `.bak`, then
+/// rename over the target. A crash mid-write (or a power loss right after)
+/// can no longer destroy the existing state.
 fn write_atomic(file: &Path, data: &str) -> Result<(), String> {
     let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
+    restrict_perms(&tmp);
     if file.exists() {
-        let _ = std::fs::copy(file, file.with_extension("json.bak"));
+        let bak = file.with_extension("json.bak");
+        if std::fs::copy(file, &bak).is_ok() {
+            restrict_perms(&bak);
+        }
     }
     std::fs::rename(&tmp, file).map_err(|e| e.to_string())
 }
@@ -56,6 +82,14 @@ pub fn save_state(app: AppHandle, data: String) -> Result<(), String> {
     write_atomic(&dir.join("state.json"), &data)
 }
 
+// SECURITY NOTE: `path` is whatever the frontend passes, with no allow-list.
+// That's intentional — these two commands back the save/export/import flow,
+// where `path` comes from a native OS file dialog and is legitimately
+// arbitrary (any directory the user picks). An allow-list here would break
+// that flow. The actual control is *who* can invoke this Tauri command in the
+// first place (capabilities/webview isolation so untrusted remote content
+// can't call it) — that lives outside src-tauri/src/storage.rs, so it's not
+// addressed by this point fix.
 #[tauri::command]
 pub fn write_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(path, contents).map_err(|e| e.to_string())
@@ -93,6 +127,30 @@ mod tests {
             "v1"
         );
         assert!(!dir.join("state.json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_restricts_perms_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("maelstrom-test-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("state.json");
+
+        write_atomic(&file, "v1").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "state.json must not be group/world readable");
+
+        write_atomic(&file, "v2").unwrap();
+        let bak_mode = std::fs::metadata(dir.join("state.json.bak"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(bak_mode, 0o600, "state.json.bak must not be group/world readable");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

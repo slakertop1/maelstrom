@@ -32,13 +32,16 @@ pub fn safe_headers(headers: &[(String, String)]) -> String {
 }
 
 /// True for query-parameter keys that carry secrets (auth tokens, API keys,
-/// and AWS/S3 presigned-URL signature fields).
+/// and AWS/S3 presigned-URL signature fields). Compared after stripping
+/// `-`/`_` and lowercasing, so `apikey`, `api_key`, `api-key` and
+/// `x-api-key` are all caught the same way.
 fn is_secret_query_key(key: &str) -> bool {
     let k = key.to_lowercase();
-    k.contains("token")
-        || k.contains("secret")
-        || k.contains("password")
-        || k.contains("apikey")
+    let norm: String = k.chars().filter(|c| *c != '-' && *c != '_').collect();
+    norm.contains("token")
+        || norm.contains("secret")
+        || norm.contains("password")
+        || norm.contains("apikey")
         || k == "key"
         || k == "access_token"
         || k == "sig"
@@ -73,7 +76,18 @@ pub fn safe_url(url: &str) -> String {
             }
             u.to_string()
         }
-        Err(_) => url.to_string(),
+        Err(_) => {
+            // Fail closed, not open: a string that's URL-shaped (has a
+            // scheme separator, query, or userinfo) but doesn't parse might
+            // still carry a secret we can't structurally locate — never echo
+            // it raw. Plain non-URL text (e.g. a synthetic run label like
+            // "5 ручек") has nothing to redact and passes through unchanged.
+            if url.contains("://") || url.contains('?') || url.contains('@') {
+                "<unparseable-url>".to_string()
+            } else {
+                url.to_string()
+            }
+        }
     }
 }
 
@@ -130,5 +144,41 @@ mod tests {
             safe_url("https://api.example.com/v1/orders"),
             "https://api.example.com/v1/orders"
         );
+    }
+
+    #[test]
+    fn url_unparsable_but_url_shaped_does_not_leak() {
+        // An unencoded space breaks Url::parse, but the string still carries
+        // a secret in its query string — the old fail-open fallback (return
+        // the raw string) would have leaked it.
+        let raw = "http://exa mple.com/x?token=SECRETVALUE";
+        assert!(reqwest::Url::parse(raw).is_err(), "test setup: input must be unparsable");
+        let masked = safe_url(raw);
+        assert!(!masked.contains("SECRETVALUE"), "leaked: {masked}");
+        assert_eq!(masked, "<unparseable-url>");
+    }
+
+    #[test]
+    fn url_plain_non_url_text_passes_through() {
+        // Synthetic run labels (scenario aggregate / stream group targets)
+        // aren't URLs and must not be replaced by the placeholder.
+        assert_eq!(safe_url("5 ручек"), "5 ручек");
+    }
+
+    #[test]
+    fn secret_query_key_matches_all_api_key_variants() {
+        for key in ["apikey", "api_key", "api-key", "x-api-key", "X-Api-Key", "X-API-KEY"] {
+            assert!(is_secret_query_key(key), "should catch: {key}");
+        }
+    }
+
+    #[test]
+    fn url_masks_api_key_dash_and_underscore_variants() {
+        for key in ["api_key", "api-key", "x-api-key"] {
+            let url = format!("https://api.example.com/x?{key}=SECRET123&q=hello");
+            let masked = safe_url(&url);
+            assert!(!masked.contains("SECRET123"), "{key} leaked: {masked}");
+            assert!(masked.contains("q=hello"));
+        }
     }
 }

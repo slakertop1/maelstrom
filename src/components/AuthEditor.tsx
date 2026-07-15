@@ -265,6 +265,7 @@ function OAuth2Editor({
           <>
             <label>Refresh Token</label>
             <input
+              type="password"
               value={cfg.refresh_token}
               onChange={(e) => setOAuth({ refresh_token: e.target.value })}
             />

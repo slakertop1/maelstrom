@@ -68,7 +68,10 @@ export default function ScenarioPanel(p: Props) {
   );
 
   const [duration, setDuration] = useState(30);
-  const [timeout, setTimeout] = useState(10000);
+  // Named timeoutMs/setTimeoutMs (not timeout/setTimeout) — the latter shadows
+  // the global window.setTimeout, which is easy to reach for by accident
+  // elsewhere in this file. See pa4.
+  const [timeoutMs, setTimeoutMs] = useState(10000);
   const [items, setItems] = useState<Record<string, { enabled: boolean; rps: number }>>(
     () => {
       const init: Record<string, { enabled: boolean; rps: number }> = {};
@@ -103,7 +106,7 @@ export default function ScenarioPanel(p: Props) {
   const start = () => {
     p.onStart({
       durationSecs: duration,
-      timeoutMs: timeout,
+      timeoutMs,
       items: selected.map((r) => ({
         requestId: r.id,
         enabled: true,
@@ -168,8 +171,8 @@ export default function ScenarioPanel(p: Props) {
                 <input
                   type="number"
                   min={100}
-                  value={timeout}
-                  onChange={(e) => setTimeout(+e.target.value || 10000)}
+                  value={timeoutMs}
+                  onChange={(e) => setTimeoutMs(+e.target.value || 10000)}
                 />
               </div>
               <div className="scenario-toolbar-spacer" />
@@ -259,7 +262,7 @@ export default function ScenarioPanel(p: Props) {
                   onClick={() =>
                     p.onExportConfig({
                       durationSecs: duration,
-                      timeoutMs: timeout,
+                      timeoutMs,
                       items: selected.map((r) => ({
                         requestId: r.id,
                         enabled: true,

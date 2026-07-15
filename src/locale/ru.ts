@@ -55,6 +55,11 @@ export const ru: Record<string, string> = {
     "Импортирован сервис «{name}»: {count} запросов.",
   "Failed to import the specification:": "Не удалось импортировать спецификацию:",
   "Unset variables": "Не заданы переменные",
+  "Couldn't load your saved data, so defaults are shown. Your saved file is left untouched — nothing is overwritten until you continue.":
+    "Не удалось загрузить сохранённые данные, показаны значения по умолчанию. Ваш сохранённый файл не тронут — ничего не перезаписывается, пока вы не продолжите.",
+  "Continue with defaults": "Продолжить со значениями по умолчанию",
+  "Couldn't save your last change: {error}": "Не удалось сохранить последнее изменение: {error}",
+  "Failed to save the file:": "Не удалось сохранить файл:",
   "The request still has unresolved variables — set them in an environment, otherwise you will {action} with invalid values:":
     "В запросе остались неподставленные переменные — задайте их в окружении, иначе {action} с некорректными значениями:",
   "Looks like a dataset reference — the syntax is":
@@ -258,6 +263,8 @@ export const ru: Record<string, string> = {
   "Copied ✓": "Скопировано ✓",
   "Copy log": "Скопировать лог",
   "Open folder": "Открыть папку",
+  "Showing the last {shown} of {total} lines — use “Copy log” or “Open folder” for the full file.":
+    "Показаны последние {shown} из {total} строк — для полного файла используйте «Скопировать лог» или «Открыть папку».",
   Clear: "Очистить",
   Collections: "Коллекции",
   "Import OpenAPI / Swagger": "Импорт OpenAPI / Swagger",
@@ -477,6 +484,9 @@ export const ru: Record<string, string> = {
   "postgres:// mysql:// (mariadb://) sqlite: — you can paste a JDBC URL":
     "postgres:// mysql:// (mariadb://) sqlite: — можно вставить JDBC-URL",
   "Connection string": "Строка подключения",
+  Show: "Показать",
+  Hide: "Скрыть",
+  "Show/hide the connection string": "Показать/скрыть строку подключения",
   "The SELECT runs once before the load; its rows are used as data":
     "SELECT выполняется один раз перед нагрузкой; строки берутся как данные",
   "Test connection": "Тест подключения",

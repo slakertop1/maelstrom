@@ -18,6 +18,7 @@ use rand::Rng;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 pub enum PickMode {
     Sequential,
@@ -314,7 +315,17 @@ async fn fetch_signed(
     url: &str,
     aws: Option<&crate::types::AwsAuth>,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let client = reqwest::Client::new();
+    // Bounded, unlike `Client::new()` — a dataset/pool URL that never answers
+    // (or a TCP handshake that never completes) used to hang the whole run's
+    // start-up forever. `connect_timeout` fails fast on an unreachable host,
+    // while the overall `timeout` is generous (5 min) so a legitimately large
+    // dataset over a slow link still downloads. Full cancellation plumbing
+    // through resolve/load_rows/load_pool is a separate follow-up (d1b) since it
+    // would ripple their signatures outside this file.
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300))
+        .build()?;
     let mut req = client.get(url);
     if let Some(a) = aws {
         if let Ok(parsed) = reqwest::Url::parse(url) {

@@ -17,12 +17,19 @@ pub struct LoadTestState {
 impl LoadTestState {
     /// Reserve the single load-test slot. Returns a fresh cancellation token
     /// and a guard handle that must be used to release the slot.
+    ///
+    /// Reserving the slot (`running`) and registering this run's cancel
+    /// token both happen while holding the `cancel` lock, so a concurrent
+    /// `stop_load_test` — which reads through that same lock — can never
+    /// observe the torn half-state where the slot looks taken but the token
+    /// isn't registered yet, and so silently has nothing to cancel (t4).
     pub fn try_start(&self) -> Result<(CancellationToken, Arc<AtomicBool>), String> {
+        let mut cancel = self.cancel.lock().unwrap();
         if self.running.swap(true, Ordering::SeqCst) {
             return Err("Нагрузочный тест уже выполняется".to_string());
         }
         let token = CancellationToken::new();
-        *self.cancel.lock().unwrap() = Some(token.clone());
+        *cancel = Some(token.clone());
         Ok((token, self.running.clone()))
     }
 }
@@ -119,9 +126,8 @@ pub async fn start_load_test(
         .timeout(Duration::from_millis(spec.timeout_ms.max(100)))
         .pool_max_idle_per_host(pool_size)
         .user_agent("Maelstrom-LoadTest/0.1");
-    builder = crate::tls::apply_tls(builder, &spec.tls).map_err(|e| {
+    builder = crate::tls::apply_tls(builder, &spec.tls).inspect_err(|_| {
         running.store(false, Ordering::SeqCst);
-        e
     })?;
     let client = builder.build().map_err(|e| {
         running.store(false, Ordering::SeqCst);
@@ -194,78 +200,87 @@ pub async fn start_load_test(
     let dropped = Arc::new(AtomicU64::new(0));
 
     tauri::async_runtime::spawn(async move {
-        let started_wall = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let started = Instant::now();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(spec.duration_secs);
+        // The run body lives in its own task so a panic anywhere inside it
+        // (aggregate, an unwrap deep in a dependency, etc.) is caught by
+        // tokio at THIS task's boundary. Awaiting `run` below then always
+        // completes — Ok or Err(JoinError) — and `running.store(false, ..)`
+        // still executes, instead of a panic unwinding straight past it and
+        // leaving the slot stuck as "running" forever (t1).
+        let run = tokio::spawn(async move {
+            let started_wall = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(spec.duration_secs);
 
-        let (tx, rx) = mpsc::unbounded_channel::<Sample>();
-        if let Some(rps) = spec.rps_limit.filter(|r| *r > 0) {
-            // OPEN MODEL — the configured RPS is the arrival rate, fired on
-            // schedule regardless of how slowly the target responds (like the
-            // multi-endpoint scenario and the CLI). Concurrency grows as needed
-            // up to a cap; VUs do NOT bound throughput here.
-            tokio::spawn(open_dispatcher(
-                client.clone(),
-                spec.clone(),
-                rps,
-                deadline,
-                token.clone(),
-                tx.clone(),
-                live_token.clone(),
-                prepared_multipart.clone(),
-                dyn_state.clone(),
-                dropped.clone(),
-            ));
-        } else {
-            // CLOSED MODEL — no target rate: the VUs hammer back-to-back, so
-            // throughput is bounded by VUs × latency.
-            for _ in 0..spec.vus {
-                let client = client.clone();
-                let spec = spec.clone();
-                let token = token.clone();
-                let tx = tx.clone();
-                let live_token = live_token.clone();
-                let mp = prepared_multipart.clone();
-                let ds = dyn_state.clone();
-                tokio::spawn(worker(client, spec, deadline, token, tx, live_token, mp, ds));
+            let (tx, rx) = mpsc::unbounded_channel::<Sample>();
+            if let Some(rps) = spec.rps_limit.filter(|r| *r > 0) {
+                // OPEN MODEL — the configured RPS is the arrival rate, fired on
+                // schedule regardless of how slowly the target responds (like the
+                // multi-endpoint scenario and the CLI). Concurrency grows as needed
+                // up to a cap; VUs do NOT bound throughput here.
+                tokio::spawn(open_dispatcher(
+                    client.clone(),
+                    spec.clone(),
+                    rps,
+                    deadline,
+                    token.clone(),
+                    tx.clone(),
+                    live_token.clone(),
+                    prepared_multipart.clone(),
+                    dyn_state.clone(),
+                    dropped.clone(),
+                ));
+            } else {
+                // CLOSED MODEL — no target rate: the VUs hammer back-to-back, so
+                // throughput is bounded by VUs × latency.
+                for _ in 0..spec.vus {
+                    let client = client.clone();
+                    let spec = spec.clone();
+                    let token = token.clone();
+                    let tx = tx.clone();
+                    let live_token = live_token.clone();
+                    let mp = prepared_multipart.clone();
+                    let ds = dyn_state.clone();
+                    tokio::spawn(worker(client, spec, deadline, token, tx, live_token, mp, ds));
+                }
             }
-        }
-        drop(tx);
+            drop(tx);
 
-        let meta = RunMeta {
-            target: spec.url.clone(),
-            kind: spec.method.clone(),
-            vus: spec.vus,
-            duration_secs: spec.duration_secs,
-            rps_limit: spec.rps_limit,
-        };
-        let mut result = aggregate(&app, rx, meta, started, started_wall, &token).await;
-        // Stop the background token refresher.
-        token.cancel();
-        // Attach the rate-limiter shortfall (0 when unlimited or fully kept up).
-        result.dropped = dropped.load(Ordering::Relaxed);
-        crate::log::write(
-            &app,
-            "LOAD ■",
-            &format!(
-                "{} {} | запросов={} ошибок={} ({:.2}%) | rps={:.0} p95={:.0}мс p99={:.0}мс{}{}",
-                result.method,
-                crate::log::safe_url(&result.url),
-                result.total_requests,
-                result.errors,
-                result.error_rate,
-                result.rps_avg,
-                result.p95_ms,
-                result.p99_ms,
-                if result.dropped > 0 {
-                    format!(" | недодано={}", result.dropped)
-                } else {
-                    String::new()
-                },
-                if result.stopped_early { " (остановлен)" } else { "" }
-            ),
-        );
-        let _ = app.emit("load_finished", &result);
+            let meta = RunMeta {
+                target: spec.url.clone(),
+                kind: spec.method.clone(),
+                vus: spec.vus,
+                duration_secs: spec.duration_secs,
+                rps_limit: spec.rps_limit,
+            };
+            let mut result = aggregate(&app, rx, meta, started, started_wall, &token).await;
+            // Stop the background token refresher.
+            token.cancel();
+            // Attach the rate-limiter shortfall (0 when unlimited or fully kept up).
+            result.dropped = dropped.load(Ordering::Relaxed);
+            crate::log::write(
+                &app,
+                "LOAD ■",
+                &format!(
+                    "{} {} | запросов={} ошибок={} ({:.2}%) | rps={:.0} p95={:.0}мс p99={:.0}мс{}{}",
+                    result.method,
+                    crate::log::safe_url(&result.url),
+                    result.total_requests,
+                    result.errors,
+                    result.error_rate,
+                    result.rps_avg,
+                    result.p95_ms,
+                    result.p99_ms,
+                    if result.dropped > 0 {
+                        format!(" | недодано={}", result.dropped)
+                    } else {
+                        String::new()
+                    },
+                    if result.stopped_early { " (остановлен)" } else { "" }
+                ),
+            );
+            let _ = app.emit("load_finished", &result);
+        });
+        let _ = run.await;
         running.store(false, Ordering::SeqCst);
     });
 
@@ -370,9 +385,19 @@ async fn open_dispatcher(
             let live_token = live_token.clone();
             let multipart = multipart.clone();
             let dyn_state = dyn_state.clone();
+            let req_token = token.clone();
             tokio::spawn(async move {
                 let start = Instant::now();
-                let status = send_once(&client, &spec, &live_token, &multipart, &dyn_state).await;
+                // Tie this request to the run's cancellation token so Stop
+                // cuts in-flight requests short instead of letting every
+                // already-dispatched one play out (t3).
+                let status = tokio::select! {
+                    _ = req_token.cancelled() => {
+                        inflight.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
+                    status = send_once(&client, &spec, &live_token, &multipart, &dyn_state) => status,
+                };
                 let latency_us = start.elapsed().as_micros().max(1) as u64;
                 inflight.fetch_sub(1, Ordering::Relaxed);
                 let _ = tx.send((latency_us, status));
@@ -382,6 +407,7 @@ async fn open_dispatcher(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker(
     client: reqwest::Client,
     spec: LoadTestSpec,
@@ -393,11 +419,16 @@ async fn worker(
     dyn_state: Arc<maelstrom_core::dynval::DynState>,
 ) {
     loop {
-        if token.is_cancelled() || tokio::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             break;
         }
         let start = Instant::now();
-        let status = send_once(&client, &spec, &live_token, &multipart, &dyn_state).await;
+        // Race the in-flight request against cancellation so Stop cuts it
+        // short instead of waiting for it to finish (t2).
+        let status = tokio::select! {
+            _ = token.cancelled() => break,
+            status = send_once(&client, &spec, &live_token, &multipart, &dyn_state) => status,
+        };
         let latency_us = start.elapsed().as_micros().max(1) as u64;
         if tx.send((latency_us, status)).is_err() {
             break;
@@ -549,7 +580,7 @@ pub(crate) async fn aggregate(
         .into_iter()
         .map(|(status, count)| (maelstrom_core::histogram::status_label(status, is_db), count))
         .collect();
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
 
     LoadTestResult {
         url: meta.target,
@@ -596,6 +627,43 @@ mod tests {
         // Releasing the slot lets a new run start.
         running.store(false, Ordering::SeqCst);
         assert!(state.try_start().is_ok(), "start after release must succeed");
+    }
+
+    // Regression for t4: reserving the slot and registering its cancel token
+    // must happen under one lock, so a `stop` racing a `start` can never
+    // observe the slot marked running with no token yet to cancel.
+    #[test]
+    fn try_start_registers_the_cancel_token_atomically_with_the_slot() {
+        let state = LoadTestState::default();
+        let (token, _running) = state.try_start().expect("reserves the slot");
+        // Simulate `stop_load_test` reading through the same lock used by
+        // try_start: the token it sees must already be the caller's token,
+        // never a stale/missing one.
+        let visible = state.cancel.lock().unwrap().clone();
+        assert!(visible.is_some(), "cancel token must already be registered");
+        assert!(!token.is_cancelled());
+        visible.unwrap().cancel();
+        assert!(token.is_cancelled(), "cancelling via the slot must cancel the caller's token");
+    }
+
+    // Regression for t1: the run task's cleanup (`running.store(false, ..)`)
+    // must still run even if the test body panics. We isolate the risky body
+    // in its own tokio task and await its JoinHandle — tokio catches a panic
+    // at that task's boundary, so the `.await` always resolves (Ok or
+    // Err(JoinError)) and control reaches the cleanup line after it, instead
+    // of the panic unwinding straight past it (as it would if cleanup lived
+    // in the very same task that panicked).
+    #[tokio::test]
+    async fn cleanup_after_awaiting_the_run_task_still_executes_on_panic() {
+        let state = LoadTestState::default();
+        let (_token, running) = state.try_start().expect("reserves the slot");
+
+        let run = tokio::spawn(async { panic!("simulated worker panic") });
+        let result = run.await;
+        assert!(result.is_err(), "the inner task must report the panic, not silently vanish");
+        running.store(false, Ordering::SeqCst);
+
+        assert!(state.try_start().is_ok(), "slot must be released despite the panic");
     }
 
     /// Mock HTTP server that sleeps `delay_ms` before every 200 reply — slow on

@@ -4,6 +4,12 @@
 use prost_reflect::{DescriptorPool, MethodDescriptor};
 use std::path::{Path, PathBuf};
 
+/// Cap on the entry `.proto` file's size, checked before it's handed to
+/// protox. Real-world `.proto` files are a few KB to a few hundred KB; this
+/// is a cheap guard against a pathological input being used to burn memory
+/// or CPU during compilation.
+const MAX_PROTO_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+
 /// A parsed `.proto` (plus its imports), ready to introspect and call.
 pub struct Proto {
     pool: DescriptorPool,
@@ -40,9 +46,39 @@ impl Proto {
             }
         }
 
+        // Guard against pathological/hostile input before it ever reaches
+        // protox: cap the entry file's size, and reject import statements
+        // that try to walk out of the include tree via ".." or an absolute
+        // path (e.g. `import "../../../../etc/passwd";`). This only covers
+        // the entry file's own imports — files pulled in later via
+        // `find_include_root` are not re-scanned; full sandboxing of the
+        // whole import graph is out of scope here.
+        let source = std::fs::read_to_string(proto).map_err(|e| format!("Ошибка чтения .proto: {e}"))?;
+        if source.len() > MAX_PROTO_SOURCE_BYTES {
+            return Err(format!(
+                "Ошибка .proto: файл слишком большой ({} байт, лимит {MAX_PROTO_SOURCE_BYTES} байт)",
+                source.len()
+            ));
+        }
+        check_import_paths(&source)?;
+
         // Retry, adding one discovered include root per round (bounded).
         for _ in 0..64 {
-            match protox::compile([proto], dirs.iter().map(|d| d.as_path())) {
+            // protox::compile on a hostile/malformed .proto has no size or
+            // recursion guard of its own; catch a panic instead of taking
+            // the whole process down with it.
+            let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                protox::compile([proto], dirs.iter().map(|d| d.as_path()))
+            }));
+            let compiled = match compiled {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(
+                        "Ошибка .proto: компилятор аварийно завершился на этом файле".to_string()
+                    )
+                }
+            };
+            match compiled {
                 Ok(fds) => {
                     let pool = DescriptorPool::from_file_descriptor_set(fds)
                         .map_err(|e| format!("Дескрипторы: {e}"))?;
@@ -70,7 +106,7 @@ impl Proto {
     /// Compile a `.proto` from inline text (single file, no imports). Written to
     /// a temp file so protox does full linking/type resolution.
     pub fn from_source(name: &str, source: &str) -> Result<Proto, String> {
-        let base = name.trim_end_matches(".proto");
+        let base = sanitize_proto_name(name);
         let dir = std::env::temp_dir().join(format!("maelstrom-proto-{}-{}", std::process::id(), base));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let file = dir.join(format!("{base}.proto"));
@@ -101,6 +137,70 @@ impl Proto {
             .find(|m| m.name() == method)
             .ok_or_else(|| format!("Метод «{method}» не найден в «{service}»"))
     }
+}
+
+/// Derive a filesystem-safe file stem from a user-supplied proto name. Only
+/// the final path segment is kept (so "/", "\" and ".." in `name` can't
+/// steer the write outside the temp dir we create), and any character
+/// outside `[A-Za-z0-9_-]` is replaced — the result never influences which
+/// *directory* gets written to, only the file name inside a process-private
+/// temp dir.
+fn sanitize_proto_name(name: &str) -> String {
+    let trimmed = name.trim_end_matches(".proto");
+    let last = trimmed.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = last
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let cleaned = cleaned.trim_matches('_').to_string();
+    if cleaned.is_empty() {
+        "proto".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Reject `.proto` import statements that try to escape the include tree via
+/// a `..` path segment or an absolute path, e.g.
+/// `import "../../../../etc/passwd";`. Best-effort static scan of the raw
+/// import string literals, run before the file is ever handed to protox.
+fn check_import_paths(source: &str) -> Result<(), String> {
+    let mut rest = source;
+    while let Some(pos) = rest.find("import") {
+        rest = &rest[pos + "import".len()..];
+        let after_kw = rest.trim_start();
+        let after_modifier = after_kw
+            .strip_prefix("public")
+            .or_else(|| after_kw.strip_prefix("weak"))
+            .map(str::trim_start)
+            .unwrap_or(after_kw);
+        let Some(quote) = after_modifier.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            continue;
+        };
+        let body = &after_modifier[1..];
+        let Some(end) = body.find(quote) else { continue };
+        let import_path = &body[..end];
+        if is_unsafe_import_path(import_path) {
+            return Err(format!(
+                "Ошибка .proto: недопустимый импорт «{import_path}» — абсолютные пути и «..» запрещены"
+            ));
+        }
+        rest = &body[end + 1..];
+    }
+    Ok(())
+}
+
+/// True if an import path is absolute (Unix or Windows-drive-letter style)
+/// or contains a `..` segment.
+fn is_unsafe_import_path(p: &str) -> bool {
+    let normalized = p.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return true;
+    }
+    if normalized.as_bytes().get(1) == Some(&b':') {
+        return true; // e.g. "C:/secrets"
+    }
+    normalized.split('/').any(|seg| seg == "..")
 }
 
 /// Pull the missing import path out of a protox compile error, e.g.

@@ -37,3 +37,83 @@ describe("lineChart y-axis never overflows the plot (regression)", () => {
     });
   }
 });
+
+describe("lineChart drops non-finite points instead of corrupting the SVG (e4)", () => {
+  function pointStrings(svg: string): string[] {
+    return [...svg.matchAll(/<(?:polyline|polygon) points="([^"]+)"/g)].map((m) => m[1]);
+  }
+
+  it("filters out NaN/Infinity points from a polyline", () => {
+    const svg = lineChart({
+      series: [
+        {
+          name: "s",
+          color: "#000",
+          points: [
+            { x: 0, y: 10 },
+            { x: 1, y: NaN },
+            { x: 2, y: Infinity },
+            { x: NaN, y: 5 },
+            { x: 3, y: 20 },
+          ],
+        },
+      ],
+    });
+    for (const attr of pointStrings(svg)) {
+      expect(attr).not.toMatch(/NaN/);
+      expect(attr).not.toMatch(/Infinity/);
+      for (const pair of attr.trim().split(/\s+/)) {
+        const [px, py] = pair.split(",").map(Number);
+        expect(Number.isFinite(px)).toBe(true);
+        expect(Number.isFinite(py)).toBe(true);
+      }
+    }
+  });
+
+  it("filters out non-finite points from a filled polygon too", () => {
+    const svg = lineChart({
+      series: [
+        {
+          name: "s",
+          color: "#000",
+          fill: true,
+          points: [
+            { x: 0, y: 10 },
+            { x: 1, y: NaN },
+            { x: 2, y: 30 },
+          ],
+        },
+      ],
+    });
+    const polygon = pointStrings(svg)[0];
+    expect(polygon).not.toMatch(/NaN/);
+  });
+
+  it("renders an empty but valid chart when every point is non-finite", () => {
+    const svg = lineChart({
+      series: [{ name: "s", color: "#000", points: [{ x: NaN, y: NaN }, { x: Infinity, y: -Infinity }] }],
+    });
+    expect(svg).not.toMatch(/NaN/);
+    expect(svg).not.toMatch(/Infinity/);
+    expect(svg.startsWith("<svg")).toBe(true);
+  });
+
+  it("a single bad point does not corrupt the surrounding valid points", () => {
+    const svg = lineChart({
+      series: [
+        {
+          name: "s",
+          color: "#000",
+          points: [
+            { x: 0, y: 5 },
+            { x: 1, y: NaN },
+            { x: 2, y: 15 },
+          ],
+        },
+      ],
+    });
+    const attr = pointStrings(svg).find((p) => !p.includes("polygon")) ?? pointStrings(svg)[0];
+    // exactly the two finite points should remain
+    expect(attr.trim().split(/\s+/).length).toBe(2);
+  });
+});

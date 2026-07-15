@@ -15,6 +15,13 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// pa3: a single cap on how much of the raw body we ever hand to
+// highlightJson/dangerouslySetInnerHTML in the default view — applies to JSON
+// and plain-text bodies alike, since both can freeze the tab on huge (multi-MB)
+// responses (regex highlighting + a DOM node per token). The user can opt into
+// rendering the full body via "show more".
+const PREVIEW_CAP = 200_000;
+
 function highlightJson(text: string): { html: string; pretty: boolean } {
   let parsed: unknown;
   try {
@@ -49,6 +56,22 @@ function fmtSize(bytes: number): string {
 export default function ResponseView({ response, error, sending, assertions }: Props) {
   const t = useT();
   const [tab, setTab] = useState<"body" | "headers">("body");
+  const [expanded, setExpanded] = useState(false);
+
+  // pa3: reset the "show full body" choice SYNCHRONOUSLY during render — not
+  // via useEffect, which only runs a render LATER. A useEffect-based reset
+  // means the very first render of a new (possibly huge) response still sees
+  // the previous response's stale expanded=true, so bodyHtml below computes
+  // truncated=false and hands the whole multi-MB body to
+  // highlightJson/dangerouslySetInnerHTML before the effect gets a chance to
+  // fix it — freezing the tab. Comparing against the previous response in
+  // state (the React-documented way to adjust state while rendering) makes
+  // the reset visible to this same render's bodyHtml computation.
+  const [prevResponse, setPrevResponse] = useState(response);
+  if (prevResponse !== response) {
+    setPrevResponse(response);
+    if (expanded) setExpanded(false);
+  }
 
   const assertResults = useMemo(() => {
     if (!response || !assertions || assertions.length === 0) return [];
@@ -61,14 +84,19 @@ export default function ResponseView({ response, error, sending, assertions }: P
   }, [response, assertions]);
 
   const bodyHtml = useMemo(() => {
-    if (!response) return { html: "", pretty: false };
+    if (!response) return { html: "", pretty: false, truncated: false, fullLength: 0 };
     if (response.body_base64)
       return {
         html: `<em>${tr2("Binary response ({size}) — preview not available", { size: fmtSize(response.size_bytes) })}</em>`,
         pretty: false,
+        truncated: false,
+        fullLength: 0,
       };
-    return highlightJson(response.body);
-  }, [response]);
+    const raw = response.body;
+    const truncated = !expanded && raw.length > PREVIEW_CAP;
+    const shown = truncated ? raw.slice(0, PREVIEW_CAP) : raw;
+    return { ...highlightJson(shown), truncated, fullLength: raw.length };
+  }, [response, expanded]);
 
   if (sending) {
     return (
@@ -154,10 +182,23 @@ export default function ResponseView({ response, error, sending, assertions }: P
         </div>
       )}
       {tab === "body" ? (
-        <div
-          className="resp-body"
-          dangerouslySetInnerHTML={{ __html: bodyHtml.html }}
-        />
+        <>
+          {bodyHtml.truncated && (
+            <div className="lt-hint" style={{ margin: "0 0 8px" }}>
+              {tr2("Preview truncated at {shown} of {total} — showing the full body may freeze the tab.", {
+                shown: fmtSize(PREVIEW_CAP),
+                total: fmtSize(bodyHtml.fullLength),
+              })}{" "}
+              <button className="ghost" onClick={() => setExpanded(true)}>
+                {t("Show full body")}
+              </button>
+            </div>
+          )}
+          <div
+            className="resp-body"
+            dangerouslySetInnerHTML={{ __html: bodyHtml.html }}
+          />
+        </>
       ) : (
         <div className="resp-body">
           <table className="resp-headers-table">

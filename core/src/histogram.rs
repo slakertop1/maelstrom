@@ -78,7 +78,11 @@ pub fn finalize_result(
     counts.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
 
     LoadTestResult {
-        url: meta.target,
+        // meta.target is a raw URL for HTTP/WS targets (may carry a
+        // presigned-S3 signature, api_key or token in the query string) —
+        // never store it unmasked in a result that ends up in the JSON/HTML
+        // report artifacts.
+        url: crate::redact::safe_url(&meta.target),
         method: meta.kind,
         vus: meta.vus,
         duration_secs: meta.duration_secs,
@@ -185,6 +189,24 @@ mod tests {
         assert!(!buckets.is_empty());
         let total: u64 = buckets.iter().map(|b| b.count).sum();
         assert_eq!(total, 50, "every sample must land in a bucket");
+    }
+
+    #[test]
+    fn finalize_masks_secret_query_in_url() {
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        hist.record(10_000).unwrap();
+        let mut status = HashMap::new();
+        status.insert(200u16, 1u64);
+        let meta = RunMeta {
+            target: "https://api.example.com/x?api_key=SECRET123&id=7".into(),
+            kind: "GET".into(),
+            vus: 1,
+            duration_secs: 1,
+            rps_limit: None,
+        };
+        let r = finalize_result(&hist, status, 1, 0, 10_000, vec![], meta, 1000.0, false);
+        assert!(!r.url.contains("SECRET123"), "secret leaked into result url: {}", r.url);
+        assert!(r.url.contains("id=7"));
     }
 
     #[test]

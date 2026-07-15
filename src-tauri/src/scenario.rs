@@ -50,42 +50,51 @@ pub async fn start_scenario_load_test(
     });
 
     tauri::async_runtime::spawn(async move {
-        match run_scenario(spec, token, on_progress, on_refresh, on_log).await {
-            Ok(result) => {
-                let per = result
-                    .targets
-                    .iter()
-                    .map(|t| {
-                        format!(
-                            "{} {}: {}зпр {:.1}%err p95={:.0}мс",
-                            t.method,
-                            crate::log::safe_url(&t.url),
-                            t.total_requests,
-                            t.error_rate,
-                            t.p95_ms
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                crate::log::write(
-                    &app,
-                    "SCENARIO ■",
-                    &format!(
-                        "всего={} ошибок={} ({:.2}%) rps={:.0} | {}",
-                        result.overall.total_requests,
-                        result.overall.errors,
-                        result.overall.error_rate,
-                        result.overall.rps_avg,
-                        per
-                    ),
-                );
-                let _ = app.emit("scenario_finished", &result);
+        // The run body lives in its own task so a panic anywhere inside
+        // `run_scenario` is caught by tokio at THIS task's boundary. Awaiting
+        // `run` below then always completes — Ok or Err(JoinError) — and
+        // `running.store(false, ..)` still executes, instead of a panic
+        // unwinding straight past it and leaving the slot stuck "running"
+        // forever (t1).
+        let run = tokio::spawn(async move {
+            match run_scenario(spec, token, on_progress, on_refresh, on_log).await {
+                Ok(result) => {
+                    let per = result
+                        .targets
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "{} {}: {}зпр {:.1}%err p95={:.0}мс",
+                                t.method,
+                                crate::log::safe_url(&t.url),
+                                t.total_requests,
+                                t.error_rate,
+                                t.p95_ms
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    crate::log::write(
+                        &app,
+                        "SCENARIO ■",
+                        &format!(
+                            "всего={} ошибок={} ({:.2}%) rps={:.0} | {}",
+                            result.overall.total_requests,
+                            result.overall.errors,
+                            result.overall.error_rate,
+                            result.overall.rps_avg,
+                            per
+                        ),
+                    );
+                    let _ = app.emit("scenario_finished", &result);
+                }
+                Err(e) => {
+                    crate::log::write(&app, "SCENARIO ✗", &e);
+                    let _ = app.emit("scenario_error", &e);
+                }
             }
-            Err(e) => {
-                crate::log::write(&app, "SCENARIO ✗", &e);
-                let _ = app.emit("scenario_error", &e);
-            }
-        }
+        });
+        let _ = run.await;
         running.store(false, Ordering::SeqCst);
     });
 

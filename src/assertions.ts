@@ -78,6 +78,38 @@ export function getByPath(root: unknown, path: string): unknown {
   return cur;
 }
 
+function isFiniteNumericString(s: string): boolean {
+  if (s.trim() === "") return false;
+  return Number.isFinite(Number(s));
+}
+
+/// Returns a finite numeric reading of `actual` when it's a number or a
+/// numeric-looking string, otherwise null. Deliberately excludes
+/// null/undefined/boolean/object/array — `Number(null) === 0` and
+/// `Number(true) === 1` would otherwise produce bogus numeric matches.
+function actualAsNumber(actual: unknown): number | null {
+  if (typeof actual === "number") return Number.isFinite(actual) ? actual : null;
+  if (typeof actual === "string" && actual.trim() !== "") {
+    const n = Number(actual);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/// eq/neq comparison for json_path: numbers (incl. numeric strings on either
+/// side) compare numerically so `19.9` matches `"19.90"`; objects/arrays are
+/// an explicit type mismatch against a scalar assertion value rather than
+/// being coerced through `String()` (which would collapse to
+/// "[object Object]"); everything else falls back to plain string equality.
+function jsonPathEquals(actual: unknown, expected: string): boolean {
+  if (actual !== null && typeof actual === "object") return false;
+  const actualNum = actualAsNumber(actual);
+  if (actualNum !== null && isFiniteNumericString(expected)) {
+    return actualNum === Number(expected);
+  }
+  return String(actual) === expected;
+}
+
 function numOp(op: AssertionOp, actual: number, expected: number): boolean {
   switch (op) {
     case "eq":
@@ -150,9 +182,9 @@ function evalOne(a: Assertion, facts: ResponseFacts): AssertionResult {
           case "contains":
             return ok(String(actual).includes(a.value), tr2("{path}=«{actual}» contains «{value}»", { path: a.target, actual: String(actual), value: a.value }));
           case "eq":
-            return ok(String(actual) === a.value, tr2("{path}=«{actual}» = «{value}»", { path: a.target, actual: String(actual), value: a.value }));
+            return ok(jsonPathEquals(actual, a.value), tr2("{path}=«{actual}» = «{value}»", { path: a.target, actual: String(actual), value: a.value }));
           case "neq":
-            return ok(String(actual) !== a.value, tr2("{path}=«{actual}» ≠ «{value}»", { path: a.target, actual: String(actual), value: a.value }));
+            return ok(!jsonPathEquals(actual, a.value), tr2("{path}=«{actual}» ≠ «{value}»", { path: a.target, actual: String(actual), value: a.value }));
           default: {
             const n = Number(actual);
             return ok(numOp(a.op, n, Number(a.value)), tr2("{path}={actual} {op} {value}", { path: a.target, actual: n, op: a.op, value: a.value }));

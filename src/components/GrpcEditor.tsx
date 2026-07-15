@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { GrpcConfig, GrpcMethodInfo } from "../types";
 import { grpcListMethods, grpcRequestTemplate } from "../api";
@@ -16,6 +16,9 @@ export default function GrpcEditor({ config, onChange }: Props) {
   const [methods, setMethods] = useState<GrpcMethodInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Bumped on every selectMethod() call so a slow grpcRequestTemplate() from a
+  // previous selection can detect it's stale and skip applying its result — ed5.
+  const selectionRef = useRef(0);
 
   const set = (patch: Partial<GrpcConfig>) => onChange({ ...config, ...patch });
 
@@ -70,11 +73,15 @@ export default function GrpcEditor({ config, onChange }: Props) {
 
   const selectMethod = async (value: string) => {
     const [service, method] = value.split("::");
+    const mySelection = ++selectionRef.current;
     set({ service, method });
     // Prefill the request body with a JSON skeleton of the method's input type.
     if (service && method && !config.body.trim()) {
       try {
         const tmpl = await grpcRequestTemplate(config.proto_path, service, method, importDirs);
+        // If the user switched to another method while this was in flight,
+        // selectionRef has moved on — drop this stale template (ed5).
+        if (selectionRef.current !== mySelection) return;
         set({ service, method, body: tmpl });
       } catch {
         /* keep body empty on failure */

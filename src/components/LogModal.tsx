@@ -1,11 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { readLog, clearLog, openLogFolder, logPath, appVersion, openUrl } from "../api";
 import { newIssueUrl } from "../config";
-import { useT } from "../i18n";
+import { useT, tr2 } from "../i18n";
 
 interface Props {
   onClose: () => void;
 }
+
+// pa5: dumping the whole log into a <textarea> can freeze the tab once the
+// file grows into the MBs — only render the tail; "Copy log" / "Report a bug"
+// still work against the full text kept in state.
+const MAX_TAIL_LINES = 3000;
 
 export default function LogModal({ onClose }: Props) {
   const t = useT();
@@ -13,6 +18,17 @@ export default function LogModal({ onClose }: Props) {
   const [path, setPath] = useState("");
   const [copied, setCopied] = useState(false);
   const [reported, setReported] = useState(false);
+
+  const view = useMemo(() => {
+    if (!text) return { display: "", truncated: false, totalLines: 0 };
+    const lines = text.split("\n");
+    if (lines.length <= MAX_TAIL_LINES) return { display: text, truncated: false, totalLines: lines.length };
+    return {
+      display: lines.slice(-MAX_TAIL_LINES).join("\n"),
+      truncated: true,
+      totalLines: lines.length,
+    };
+  }, [text]);
 
   const refresh = () => {
     readLog().then(setText).catch(() => setText(""));
@@ -82,7 +98,15 @@ export default function LogModal({ onClose }: Props) {
             <code>Authorization</code> {t("are never written to the log (they are masked as")}{" "}
             <code>***</code>{t(").")}
           </div>
-          <textarea className="log-view" value={text || t("(log is empty)")} readOnly spellCheck={false} />
+          {view.truncated && (
+            <div className="log-hint">
+              {tr2("Showing the last {shown} of {total} lines — use “Copy log” or “Open folder” for the full file.", {
+                shown: MAX_TAIL_LINES,
+                total: view.totalLines,
+              })}
+            </div>
+          )}
+          <textarea className="log-view" value={view.display || t("(log is empty)")} readOnly spellCheck={false} />
           {path && <div className="log-path">{path}</div>}
         </div>
       </div>

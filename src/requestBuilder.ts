@@ -77,9 +77,18 @@ export function buildAuthRefresh(
 export function buildRequest(
   req: RequestConfig,
   env: Environment | null,
-  forExport = false
+  forExport = false,
+  // Chain-extract names (streams): a var whose name collides with something
+  // the chain extracts from an earlier response must stay a {{name}}
+  // placeholder for the runtime engine to fill in — baking the Environment's
+  // value here would statically freeze it and break the chain. See
+  // streamsBuilder.ts, which passes every extract name in the stream.
+  excludeVarNames?: ReadonlySet<string> | readonly string[]
 ): BuiltRequest {
   const vars = envVars(env, forExport);
+  if (excludeVarNames) {
+    for (const name of excludeVarNames) vars.delete(name);
+  }
   const r = (s: string) => resolveVars(s, vars);
 
   let url = r(req.url.trim());

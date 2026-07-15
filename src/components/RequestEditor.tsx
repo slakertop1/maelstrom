@@ -171,7 +171,11 @@ export default function RequestEditor(p: Props) {
           tab === "load" ? (
             p.loadTestPanel
           ) : (
-            <GrpcEditor config={req.grpc} onChange={(grpc) => set({ grpc })} />
+            <GrpcEditor
+              key={req.id} // reset methods/error/loading state per request — see ed2
+              config={req.grpc}
+              onChange={(grpc) => set({ grpc })}
+            />
           )
         ) : isWs ? (
           tab === "load" ? (
@@ -362,6 +366,9 @@ function DbBar({
   onSave: () => void;
 }) {
   const t = useT();
+  // ed4: connection strings are frequently user:pass@host — hide them like a
+  // password field, with a toggle to reveal for copy/paste checks.
+  const [showUrl, setShowUrl] = useState(false);
   return (
     <div className="request-bar">
       <select
@@ -374,18 +381,24 @@ function DbBar({
         <option value="mysql">MySQL</option>
         <option value="sqlite">SQLite</option>
       </select>
-      <input
-        className="url"
-        placeholder={
-          request.db.driver === "postgres"
-            ? "postgres://user:pass@host:5432/db"
-            : request.db.driver === "mysql"
-              ? "mysql://user:pass@host:3306/db"
-              : "sqlite:///path/to/file.db"
-        }
-        value={request.db.url}
-        onChange={(e) => set({ db: { ...request.db, url: e.target.value } })}
-      />
+      <div className="tls-file-input" style={{ flex: 1 }}>
+        <input
+          className="url"
+          type={showUrl ? "text" : "password"}
+          placeholder={
+            request.db.driver === "postgres"
+              ? "postgres://user:pass@host:5432/db"
+              : request.db.driver === "mysql"
+                ? "mysql://user:pass@host:3306/db"
+                : "sqlite:///path/to/file.db"
+          }
+          value={request.db.url}
+          onChange={(e) => set({ db: { ...request.db, url: e.target.value } })}
+        />
+        <button className="ghost" onClick={() => setShowUrl((s) => !s)} title={t("Show/hide the connection string")}>
+          {showUrl ? t("Hide") : t("Show")}
+        </button>
+      </div>
       <button className="primary" onClick={onSend} disabled={sending || !canSend}>
         {sending ? <span className="spinner" /> : t("Run")}
       </button>

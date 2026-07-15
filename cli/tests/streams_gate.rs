@@ -93,6 +93,21 @@ fn per_stream_success_rate_floor_gates_the_run() {
 }
 
 #[test]
+fn invalid_or_empty_config_exits_with_code_2() {
+    // Malformed JSON → config parse failure → exit 2.
+    assert_eq!(run_cli("bad-json", "{ not valid json", &[]), 2, "malformed config → exit 2");
+
+    // Well-formed JSON but none of targets/streams/grpc/websocket present →
+    // nothing to run → exit 2 (rather than a silent no-op exit 0).
+    let empty = r#"{"duration_secs": 2}"#;
+    assert_eq!(
+        run_cli("empty-cfg", empty, &[]),
+        2,
+        "config with no targets/streams/grpc/websocket → exit 2"
+    );
+}
+
+#[test]
 fn cli_flag_overrides_a_laxer_config_floor() {
     let base = spawn_mock();
     // Config sets a permissive floor (0) that alone would pass a 0%-completion stream.

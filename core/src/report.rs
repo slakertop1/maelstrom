@@ -212,7 +212,11 @@ const REPORT_CSS: &str = r#"
 "#;
 
 fn short_url(url: &str) -> String {
-    match reqwest::Url::parse(url) {
+    // Mask secret query params / userinfo first (presigned-S3 signatures,
+    // tokens, api_key, ...) — the HTML report is a shareable artifact and
+    // must never carry them, even after we drop the scheme+host below.
+    let masked = crate::redact::safe_url(url);
+    match reqwest::Url::parse(&masked) {
         Ok(u) => {
             let mut p = u.path().to_string();
             if let Some(q) = u.query() {
@@ -221,7 +225,9 @@ fn short_url(url: &str) -> String {
             }
             p
         }
-        Err(_) => url.to_string(),
+        // `masked` is already either a fully-redacted URL string or (for
+        // non-URL input) safe as-is — never fall back to the original `url`.
+        Err(_) => masked,
     }
 }
 

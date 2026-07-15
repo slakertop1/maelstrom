@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { buildStreamsScenario, streamsMissingVars } from "./streamsBuilder";
-import { newRequest, newMultipartField, RequestConfig, UiStream, DatasetSpec } from "./types";
+import { newRequest, newMultipartField, RequestConfig, UiStream, DatasetSpec, Environment } from "./types";
+
+const env = (vars: [string, string][]): Environment => ({
+  id: "e",
+  name: "t",
+  variables: vars.map(([key, value], i) => ({ id: String(i), key, value, enabled: true })),
+});
 
 function req(name: string, patch: Partial<RequestConfig> = {}): RequestConfig {
   return { ...newRequest(name), ...patch };
@@ -153,6 +159,103 @@ describe("buildStreamsScenario", () => {
     );
     expect(specYes.datasets).toHaveLength(1);
   });
+
+  it("leaves {{name}} unresolved when an Environment var collides with a chain-extract name (f2)", () => {
+    // Without the fix, buildRequest would bake the Environment's "FROM_ENV"
+    // into the header statically, and the chain would never see the value
+    // the earlier step actually extracted at run time.
+    const login = req("login", { url: "https://api/login" });
+    const order = req("order", {
+      url: "https://api/order",
+      headers: [{ id: "h", key: "Authorization", value: "Bearer {{token}}", enabled: true }],
+    });
+    const streams: UiStream[] = [
+      ui({
+        steps: [
+          {
+            id: "st1",
+            requestId: login.id,
+            extract: [{ id: "e", name: "token", from: "json", expr: "data.token" }],
+          },
+          { id: "st2", requestId: order.id, extract: [] },
+        ],
+      }),
+    ];
+    const spec = buildStreamsScenario(
+      streams,
+      byIdOf([login, order]),
+      env([["token", "FROM_ENV"]]), // same name as the chain's extract — must NOT win
+      10,
+      5000,
+      []
+    );
+    expect(spec.streams[0].steps[1].headers).toContainEqual(["Authorization", "Bearer {{token}}"]);
+  });
+
+  it("still bakes an unrelated Environment var normally alongside a colliding one", () => {
+    const login = req("login", { url: "https://api/login" });
+    const order = req("order", {
+      url: "https://{{host}}/order",
+      headers: [{ id: "h", key: "Authorization", value: "Bearer {{token}}", enabled: true }],
+    });
+    const streams: UiStream[] = [
+      ui({
+        steps: [
+          {
+            id: "st1",
+            requestId: login.id,
+            extract: [{ id: "e", name: "token", from: "json", expr: "data.token" }],
+          },
+          { id: "st2", requestId: order.id, extract: [] },
+        ],
+      }),
+    ];
+    const spec = buildStreamsScenario(
+      streams,
+      byIdOf([login, order]),
+      env([
+        ["host", "api.example.com"],
+        ["token", "FROM_ENV"],
+      ]),
+      10,
+      5000,
+      []
+    );
+    expect(spec.streams[0].steps[1].url).toBe("https://api.example.com/order");
+    expect(spec.streams[0].steps[1].headers).toContainEqual(["Authorization", "Bearer {{token}}"]);
+  });
+
+  it("order-scopes the chain-var exclusion (f2): a step BEFORE the extract resolves the Environment value normally", () => {
+    // "token" is extracted by step 2, but step 1 runs first and should see the
+    // Environment's value for "token" — the collision only matters for steps
+    // AT OR AFTER the extraction, not ones that precede it.
+    const first = req("first", {
+      url: "https://api/first",
+      headers: [{ id: "h", key: "Authorization", value: "Bearer {{token}}", enabled: true }],
+    });
+    const login = req("login", { url: "https://api/login" });
+    const streams: UiStream[] = [
+      ui({
+        steps: [
+          { id: "st1", requestId: first.id, extract: [] },
+          {
+            id: "st2",
+            requestId: login.id,
+            extract: [{ id: "e", name: "token", from: "json", expr: "data.token" }],
+          },
+        ],
+      }),
+    ];
+    const spec = buildStreamsScenario(
+      streams,
+      byIdOf([first, login]),
+      env([["token", "FROM_ENV"]]),
+      10,
+      5000,
+      []
+    );
+    expect(spec.streams[0].steps[0].headers).toContainEqual(["Authorization", "Bearer FROM_ENV"]);
+  });
 });
 
 describe("streamsMissingVars", () => {
@@ -177,5 +280,79 @@ describe("streamsMissingVars", () => {
     const missing = streamsMissingVars(streams, byIdOf([login, order]), null);
     expect(missing).toContain("orderId");
     expect(missing).not.toContain("token"); // extracted at runtime, not an env var
+  });
+
+  it("does NOT let a later extract silence the same var used by an earlier step (f3 ordering)", () => {
+    // step1 uses {{token}} before anything has extracted it → must be flagged.
+    // step3 happens to extract a var named "token" — that must not retroactively
+    // silence step1's usage, since the chain runs in order and step1 ran first.
+    const step1 = req("step1", {
+      url: "https://api/order",
+      headers: [{ id: "h", key: "Authorization", value: "Bearer {{token}}", enabled: true }],
+    });
+    const step2 = req("step2", { url: "https://api/mid" });
+    const step3 = req("step3", { url: "https://api/login" });
+    const streams: UiStream[] = [
+      ui({
+        steps: [
+          { id: "st1", requestId: step1.id, extract: [] },
+          { id: "st2", requestId: step2.id, extract: [] },
+          {
+            id: "st3",
+            requestId: step3.id,
+            extract: [{ id: "e", name: "token", from: "json", expr: "data.token" }],
+          },
+        ],
+      }),
+    ];
+    const missing = streamsMissingVars(streams, byIdOf([step1, step2, step3]), null);
+    expect(missing).toContain("token");
+  });
+
+  it("does not flag a var used by a step AFTER it's been extracted earlier in the same chain", () => {
+    const login = req("login", { url: "https://api/login" });
+    const order = req("order", {
+      url: "https://api/order",
+      headers: [{ id: "h", key: "Authorization", value: "Bearer {{token}}", enabled: true }],
+    });
+    const streams: UiStream[] = [
+      ui({
+        steps: [
+          {
+            id: "st1",
+            requestId: login.id,
+            extract: [{ id: "e", name: "token", from: "json", expr: "data.token" }],
+          },
+          { id: "st2", requestId: order.id, extract: [] },
+        ],
+      }),
+    ];
+    const missing = streamsMissingVars(streams, byIdOf([login, order]), null);
+    expect(missing).not.toContain("token");
+  });
+
+  it("does not flag a var used BEFORE its colliding extract when the Environment defines it (f2 consistency)", () => {
+    // "token" is extracted by step 2, but step 1 runs first with an Environment
+    // that already defines "token" — step 1 should resolve normally and not be
+    // reported as missing (mirrors the buildStreamsScenario f2 fix).
+    const first = req("first", {
+      url: "https://api/first",
+      headers: [{ id: "h", key: "Authorization", value: "Bearer {{token}}", enabled: true }],
+    });
+    const login = req("login", { url: "https://api/login" });
+    const streams: UiStream[] = [
+      ui({
+        steps: [
+          { id: "st1", requestId: first.id, extract: [] },
+          {
+            id: "st2",
+            requestId: login.id,
+            extract: [{ id: "e", name: "token", from: "json", expr: "data.token" }],
+          },
+        ],
+      }),
+    ];
+    const missing = streamsMissingVars(streams, byIdOf([first, login]), env([["token", "FROM_ENV"]]));
+    expect(missing).not.toContain("token");
   });
 });

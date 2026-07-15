@@ -84,6 +84,24 @@ const activeVars = (env: Environment | null) => envVars(env, false);
 // buildRequest / buildAuthRefresh / unresolvedVars / builtStrings live in
 // ./requestBuilder (pure + unit-tested).
 
+// Slack absorbing the backend's second-only `started_at` precision (Rust's
+// "%Y-%m-%d %H:%M:%S") against our millisecond `Date.now()` tracking marker —
+// without it, a run that legitimately starts and finishes within the same
+// wall-clock second would look "stale" to itself (see predatesTracking).
+const STALE_TOLERANCE_MS = 2000;
+
+/// A terminal `load_finished`/`scenario_finished`/`streams_finished` payload
+/// whose own `started_at` clearly predates `sinceMs` (frontend `Date.now()`
+/// captured when we started tracking the CURRENT run, minus the tolerance
+/// above) belongs to an earlier, already-superseded run — see the a1 fix in
+/// the events effect below. Events carry no run id, so this can't be exact;
+/// it's a best-effort filter for the case a run is abandoned (Close) and a
+/// new one starts before the old one's stop is confirmed.
+function predatesTracking(sinceMs: number, startedAt: string): boolean {
+  const t = Date.parse(startedAt.replace(" ", "T"));
+  return !Number.isNaN(t) && t < sinceMs - STALE_TOLERANCE_MS;
+}
+
 function defaultCollections(): Collection[] {
   const example = newRequest(tr("Example: JSON API"));
   example.url = "https://jsonplaceholder.typicode.com/posts/1";
@@ -108,9 +126,16 @@ export default function App() {
   // Set when loading persisted state failed: we show defaults but must NOT
   // auto-save over the user's (possibly recoverable) file until they acknowledge.
   const [stateLoadError, setStateLoadError] = useState<string | null>(null);
+  // Set when a debounced/flush save fails (a5) — the in-memory edits are fine,
+  // but nothing actually reached disk, which is worth surfacing to the user.
+  const [stateSaveError, setStateSaveError] = useState<string | null>(null);
   const [exportCfg, setExportCfg] = useState<{ json: string; defaultName: string } | null>(null);
 
   const [current, setCurrent] = useState<RequestConfig>(newRequest());
+  // Mirrors `current.id` for async handlers (a2) that must ignore a result
+  // meant for a request the user has since navigated away from.
+  const currentIdRef = useRef(current.id);
+  currentIdRef.current = current.id;
   const [sourceCollectionId, setSourceCollectionId] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
 
@@ -229,7 +254,9 @@ export default function App() {
     if (persistTimer.current) window.clearTimeout(persistTimer.current);
     persistTimer.current = window.setTimeout(() => {
       pendingSave.current = null;
-      saveState(state).catch(() => {});
+      saveState(state)
+        .then(() => setStateSaveError(null))
+        .catch((e) => setStateSaveError(String(e)));
     }, 400);
   }, [collections, environments, activeEnvId, datasets, tokenUrls, authProfiles, loaded, stateLoadError]);
 
@@ -240,7 +267,7 @@ export default function App() {
       const s = pendingSave.current;
       if (s) {
         pendingSave.current = null;
-        saveState(s).catch(() => {});
+        saveState(s).catch((e) => setStateSaveError(String(e)));
       }
     };
     window.addEventListener("beforeunload", flush);
@@ -250,10 +277,45 @@ export default function App() {
     };
   }, []);
 
+  // ---- load/scenario/streams run tracking (a1, pa1) ----
+  // The backend serializes load test / scenario / streams runs on ONE global
+  // slot (LoadTestState::try_start in loadtest.rs): a new run cannot start
+  // until the previous one has released it, which only happens AFTER its own
+  // *_finished/*_error was emitted. execute*() below refuses to start a new
+  // run while `xxGenRef` is already non-zero (closing pa1's double-click
+  // race). `xxGenRef` is 0 when nothing is tracked and non-zero while a run
+  // is in flight; the listeners only accept events while it's set, and
+  // open*()/close*() invalidate it so a run abandoned via Close doesn't land
+  // on a reopened panel. Events carry no run id, so if Close lets a new run
+  // start before the old one's stop is confirmed, both would look "tracked"
+  // at once — `xxSinceRef` (wall-clock moment tracking began) plus
+  // predatesTracking() catches that residual case for the terminal events,
+  // where getting it wrong is worst (a1).
+  const ltGenRef = useRef(0);
+  const ltSinceRef = useRef(0);
+  const scGenRef = useRef(0);
+  const scSinceRef = useRef(0);
+  const stGenRef = useRef(0);
+  const stSinceRef = useRef(0);
+  const nextRunGen = useRef(0);
+
   // ---- load test events ----
   useEffect(() => {
     const unsubs: (() => void)[] = [];
-    listen<ProgressSnapshot>("load_progress", (e) => {
+    // StrictMode/remount can run this effect's cleanup before a listen()
+    // promise resolves; pushing the late unlisten into `unsubs` after cleanup
+    // already ran loses it — the handler stays registered and, once the
+    // effect re-runs, fires twice for every event (a3). `cancelled` catches
+    // that: if cleanup already happened, unlisten immediately instead.
+    let cancelled = false;
+    const sub = <T,>(name: string, handler: (e: { payload: T }) => void) => {
+      listen<T>(name, handler).then((u) => {
+        if (cancelled) u();
+        else unsubs.push(u);
+      });
+    };
+    sub<ProgressSnapshot>("load_progress", (e) => {
+      if (!ltGenRef.current) return; // no run tracked — stale (a1)
       setLtProgress(e.payload);
       // Bound the LIVE series so a long run stays O(cap) per tick instead of
       // O(n) (the whole SVG is rebuilt each second). The final report uses the
@@ -262,45 +324,62 @@ export default function App() {
         const next = [...t, e.payload.point];
         return next.length > MAX_LIVE_POINTS ? next.filter((_, i) => i % 2 === 0) : next;
       });
-    }).then((u) => unsubs.push(u));
-    listen<LoadTestResult>("load_finished", (e) => {
+    });
+    sub<LoadTestResult>("load_finished", (e) => {
+      if (!ltGenRef.current || predatesTracking(ltSinceRef.current, e.payload.started_at)) return;
+      ltGenRef.current = 0;
       setLtResult(e.payload);
       setLtRunning(false);
-    }).then((u) => unsubs.push(u));
-    listen<string>("load_error", (e) => {
+    });
+    sub<string>("load_error", (e) => {
+      if (!ltGenRef.current) return;
+      ltGenRef.current = 0;
       setLtError(e.payload);
       setLtRunning(false);
-    }).then((u) => unsubs.push(u));
-    listen<ScenarioProgress>("scenario_progress", (e) => {
+    });
+    sub<ScenarioProgress>("scenario_progress", (e) => {
+      if (!scGenRef.current) return;
       setScProgress(e.payload);
       setScProgressLog((log) => {
         const next = [...log, e.payload];
         return next.length > MAX_LIVE_POINTS ? next.filter((_, i) => i % 2 === 0) : next;
       });
-    }).then((u) => unsubs.push(u));
-    listen<ScenarioResult>("scenario_finished", (e) => {
+    });
+    sub<ScenarioResult>("scenario_finished", (e) => {
+      if (!scGenRef.current || predatesTracking(scSinceRef.current, e.payload.started_at)) return;
+      scGenRef.current = 0;
       setScResult(e.payload);
       setScRunning(false);
-    }).then((u) => unsubs.push(u));
-    listen<string>("scenario_error", (e) => {
+    });
+    sub<string>("scenario_error", (e) => {
+      if (!scGenRef.current) return;
+      scGenRef.current = 0;
       setScError(e.payload);
       setScRunning(false);
-    }).then((u) => unsubs.push(u));
-    listen<StreamsProgress>("streams_progress", (e) => setStProgress(e.payload)).then((u) =>
-      unsubs.push(u)
-    );
-    listen<StreamsResult>("streams_finished", (e) => {
+    });
+    sub<StreamsProgress>("streams_progress", (e) => {
+      if (!stGenRef.current) return;
+      setStProgress(e.payload);
+    });
+    sub<StreamsResult>("streams_finished", (e) => {
+      if (!stGenRef.current || predatesTracking(stSinceRef.current, e.payload.started_at)) return;
+      stGenRef.current = 0;
       setStResult(e.payload);
       setStRunning(false);
-    }).then((u) => unsubs.push(u));
-    listen<string>("streams_error", (e) => {
+    });
+    sub<string>("streams_error", (e) => {
+      if (!stGenRef.current) return;
+      stGenRef.current = 0;
       setStError(e.payload);
       setStRunning(false);
-    }).then((u) => unsubs.push(u));
-    listen<number>("token_refreshed", (e) => {
+    });
+    sub<number>("token_refreshed", (e) => {
       setTokenRefreshes(e.payload);
-    }).then((u) => unsubs.push(u));
-    return () => unsubs.forEach((u) => u());
+    });
+    return () => {
+      cancelled = true;
+      unsubs.forEach((u) => u());
+    };
   }, []);
 
   // ---- auth profiles (reusable auth setups) ----
@@ -379,6 +458,11 @@ export default function App() {
   const saveCurrent = () => saveRequest(current);
 
   const executeSend = useCallback(async () => {
+    // Captured now (before any await) so a slow response can tell, on arrival,
+    // whether the user is still looking at the request it was sent for — a
+    // faster response for a request opened afterwards must not get clobbered
+    // by this one landing late (a2, same idea as fetchToken below).
+    const reqId = current.id;
     setSending(true);
     setResponse(null);
     setRespError(null);
@@ -399,7 +483,7 @@ export default function App() {
           username: resolveVars(current.db.username, vars),
           password: current.db.password,
         });
-        setDbResult(res);
+        if (currentIdRef.current === reqId) setDbResult(res);
       } else if (current.kind === "grpc") {
         const vars = activeVars(activeEnv);
         const g = current.grpc;
@@ -414,7 +498,7 @@ export default function App() {
           body: resolveVars(g.body, vars),
           timeout_ms: 30000,
         });
-        setGrpcResult(res);
+        if (currentIdRef.current === reqId) setGrpcResult(res);
       } else if (current.kind === "ws") {
         const vars = activeVars(activeEnv);
         const w = current.ws;
@@ -424,7 +508,7 @@ export default function App() {
           message: resolveVars(w.message, vars),
           timeout_ms: 5000,
         });
-        setWsResult(res);
+        if (currentIdRef.current === reqId) setWsResult(res);
       } else {
         if (!current.url.trim()) return;
         const built = buildRequest(current, activeEnv);
@@ -436,11 +520,17 @@ export default function App() {
           timeout_ms: 30000,
           datasets: usesData ? datasets.filter((d) => d.name.trim()).map(toDatasetSpec) : [],
         });
-        setResponse(resp);
+        if (currentIdRef.current === reqId) setResponse(resp);
       }
     } catch (e) {
-      setRespError(String(e));
+      if (currentIdRef.current === reqId) setRespError(String(e));
     } finally {
+      // a2: `sending` is a single GLOBAL UI flag (it gates the Send/Run
+      // button), so it must always be cleared here regardless of which
+      // request is currently open — otherwise switching requests mid-flight
+      // leaves the button stuck disabled forever, since currentIdRef would
+      // never match `reqId` again. Only the RESULT setters above are gated on
+      // the id match (so a late response can't clobber a newer request).
       setSending(false);
     }
   }, [current, activeEnv, datasets]);
@@ -533,6 +623,15 @@ export default function App() {
 
   // ---- load test actions ----
   const executeLoadTest = async () => {
+    // Synchronous guard: a second click before this render commits still sees
+    // the stale (pre-update) `ltRunning` from the closure, so without gating
+    // on a ref here a fast double-click starts two overlapping runs (pa1).
+    // The same ref fences stale *_progress/*_finished/*_error from a run
+    // that's since been superseded (a1) — see the listeners above.
+    if (ltGenRef.current) return;
+    ltGenRef.current = ++nextRunGen.current;
+    ltSinceRef.current = Date.now();
+    setLtRunning(true);
     setLtError(null);
     setLtResult(null);
     setLtProgress(null);
@@ -599,8 +698,9 @@ export default function App() {
           file_pools: built.file_pools,
         });
       }
-      setLtRunning(true);
     } catch (e) {
+      ltGenRef.current = 0; // roll back — no run actually started (pa1)
+      setLtRunning(false);
       setLtError(String(e));
     }
   };
@@ -641,6 +741,13 @@ export default function App() {
 
   // ---- scenario (multi-endpoint) load ----
   const openScenario = (collectionId: string) => {
+    // Switching collections (the sidebar's ⚡ icon calls this directly,
+    // without going through closeScenario) while a previous run's stop
+    // hasn't been confirmed must not let its stale events land on THIS view
+    // — send the stop signal if we hadn't already, and stop tracking it (a1).
+    if (scRunning) stopLoadTest().catch(() => {});
+    scGenRef.current = 0;
+    setScRunning(false);
     setScenarioColId(collectionId);
     setScResult(null);
     setScProgress(null);
@@ -650,6 +757,12 @@ export default function App() {
 
   const closeScenario = () => {
     if (scRunning) stopLoadTest().catch(() => {});
+    // Invalidate tracking so a *_progress/*_finished still in flight for this
+    // (now-hidden) run is dropped by the listeners above instead of landing
+    // on whatever's opened next (a1); also unblocks Run immediately rather
+    // than waiting on a stop confirmation nobody will see.
+    scGenRef.current = 0;
+    setScRunning(false);
     setScenarioColId(null);
   };
 
@@ -660,6 +773,10 @@ export default function App() {
     filePools: FilePoolSpec[],
     config: ScenarioRunConfig
   ) => {
+    if (scGenRef.current) return; // already starting/running (pa1)
+    scGenRef.current = ++nextRunGen.current;
+    scSinceRef.current = Date.now();
+    setScRunning(true);
     setScError(null);
     setScResult(null);
     setScProgress(null);
@@ -678,8 +795,9 @@ export default function App() {
         datasets: usesData ? datasets.filter((d) => d.name.trim()).map(toDatasetSpec) : [],
         file_pools: filePools,
       });
-      setScRunning(true);
     } catch (e) {
+      scGenRef.current = 0;
+      setScRunning(false);
       setScError(String(e));
     }
   };
@@ -710,6 +828,10 @@ export default function App() {
 
   // ---- streams (request chaining) load ----
   const openStreams = (collectionId: string) => {
+    // See openScenario above — same reasoning (a1).
+    if (stRunning) stopLoadTest().catch(() => {});
+    stGenRef.current = 0;
+    setStRunning(false);
     setStreamsColId(collectionId);
     setStResult(null);
     setStProgress(null);
@@ -717,6 +839,9 @@ export default function App() {
   };
   const closeStreams = () => {
     if (stRunning) stopLoadTest().catch(() => {});
+    // See closeScenario above — same reasoning (a1).
+    stGenRef.current = 0;
+    setStRunning(false);
     setStreamsColId(null);
   };
   const streamsCollection = collections.find((c) => c.id === streamsColId) ?? null;
@@ -732,6 +857,10 @@ export default function App() {
 
   const executeStreams = async (config: StreamRunConfig) => {
     if (!streamsCollection) return;
+    if (stGenRef.current) return; // already starting/running (pa1)
+    stGenRef.current = ++nextRunGen.current;
+    stSinceRef.current = Date.now();
+    setStRunning(true);
     setStError(null);
     setStResult(null);
     setStProgress(null);
@@ -746,12 +875,15 @@ export default function App() {
         datasets.filter((d) => d.name.trim()).map(toDatasetSpec)
       );
       if (spec.streams.length === 0) {
+        stGenRef.current = 0;
+        setStRunning(false);
         setStError(t("No runnable streams (every step's request is missing)."));
         return;
       }
       await startStreamsLoadTest(spec);
-      setStRunning(true);
     } catch (e) {
+      stGenRef.current = 0;
+      setStRunning(false);
       setStError(String(e));
     }
   };
@@ -808,7 +940,10 @@ export default function App() {
       targets,
       datasets: datasets.filter((d) => d.name.trim()).map(toDatasetSpec),
       file_pools: filePools,
-      thresholds: { max_error_rate: 1.0, max_p95_ms: 500 },
+      // f6: keep in sync with DEFAULT_MAX_ERROR_RATE_PCT in cliExport.ts —
+      // the single-request CLI export uses that constant, and the
+      // scenario export must use the same default gate.
+      thresholds: { max_error_rate: 5.0, max_p95_ms: 500 },
     };
     const safeName = scenarioCollection.name.replace(/[^\wа-яА-Я.-]+/g, "-").toLowerCase();
     // Open the export dialog: it lists the ${ENV} vars the config needs, lets the
@@ -820,12 +955,16 @@ export default function App() {
   };
 
   const saveExportedConfig = async (finalJson: string, defName: string) => {
-    const path = await save({
-      defaultPath: defName,
-      filters: [{ name: "JSON", extensions: ["json"] }],
-    });
-    if (!path) return;
-    await writeTextFile(path, finalJson);
+    try {
+      const path = await save({
+        defaultPath: defName,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await writeTextFile(path, finalJson);
+    } catch (e) {
+      alert(`${t("Failed to save the file:")}\n${String(e)}`);
+    }
   };
 
   // Export the CURRENT single request (from the Load tab) as a CLI scenario.json.
@@ -877,30 +1016,38 @@ export default function App() {
 
   const exportScenarioReport = async () => {
     if (!scResult) return;
-    const stamp = scResult.started_at.replace(/[: ]/g, "-");
-    const path = await save({
-      defaultPath: `scenario-${stamp}.html`,
-      filters: [{ name: t("HTML report"), extensions: ["html"] }],
-    });
-    if (!path) return;
-    await writeTextFile(path, buildScenarioReportHtml(scResult));
+    try {
+      const stamp = scResult.started_at.replace(/[: ]/g, "-");
+      const path = await save({
+        defaultPath: `scenario-${stamp}.html`,
+        filters: [{ name: t("HTML report"), extensions: ["html"] }],
+      });
+      if (!path) return;
+      await writeTextFile(path, buildScenarioReportHtml(scResult));
+    } catch (e) {
+      alert(`${t("Failed to save the file:")}\n${String(e)}`);
+    }
   };
 
   const exportReport = async (kind: "html" | "json") => {
     if (!ltResult) return;
-    const stamp = ltResult.started_at.replace(/[: ]/g, "-");
-    const path = await save({
-      defaultPath: `loadtest-${stamp}.${kind}`,
-      filters: [
-        kind === "html"
-          ? { name: t("HTML report"), extensions: ["html"] }
-          : { name: "JSON", extensions: ["json"] },
-      ],
-    });
-    if (!path) return;
-    const contents =
-      kind === "html" ? buildReportHtml(ltResult) : JSON.stringify(ltResult, null, 2);
-    await writeTextFile(path, contents);
+    try {
+      const stamp = ltResult.started_at.replace(/[: ]/g, "-");
+      const path = await save({
+        defaultPath: `loadtest-${stamp}.${kind}`,
+        filters: [
+          kind === "html"
+            ? { name: t("HTML report"), extensions: ["html"] }
+            : { name: "JSON", extensions: ["json"] },
+        ],
+      });
+      if (!path) return;
+      const contents =
+        kind === "html" ? buildReportHtml(ltResult) : JSON.stringify(ltResult, null, 2);
+      await writeTextFile(path, contents);
+    } catch (e) {
+      alert(`${t("Failed to save the file:")}\n${String(e)}`);
+    }
   };
 
   const importSpec = async () => {
@@ -993,6 +1140,24 @@ export default function App() {
           <button onClick={() => setStateLoadError(null)}>
             {t("Continue with defaults")}
           </button>
+        </div>
+      )}
+      {stateSaveError && (
+        <div
+          className="state-load-error"
+          style={{
+            padding: "10px 16px",
+            background: "rgba(248, 81, 73, 0.15)",
+            borderBottom: "1px solid rgba(248, 81, 73, 0.5)",
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
+          <span style={{ flex: 1 }}>
+            ⚠ {tr2("Couldn't save your last change: {error}", { error: stateSaveError })}
+          </span>
+          <button onClick={() => setStateSaveError(null)}>{t("Close")}</button>
         </div>
       )}
       <div className="topbar">

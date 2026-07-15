@@ -15,6 +15,7 @@ export default function DatasetsModal({ datasets, onChange, onClose }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(datasets[0]?.id ?? null);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [showDbUrl, setShowDbUrl] = useState(false);
   const selected = datasets.find((d) => d.id === selectedId) ?? null;
 
   const select = (id: string | null) => {
@@ -209,11 +210,17 @@ export default function DatasetsModal({ datasets, onChange, onClose }: Props) {
                     <label title={t("postgres:// mysql:// (mariadb://) sqlite: — you can paste a JDBC URL")}>
                       {t("Connection string")}
                     </label>
-                    <input
-                      value={selected.db_url}
-                      placeholder="postgres://user:pass@host:5432/db"
-                      onChange={(e) => update({ db_url: e.target.value })}
-                    />
+                    <div className="tls-file-input">
+                      <input
+                        type={showDbUrl ? "text" : "password"}
+                        value={selected.db_url}
+                        placeholder="postgres://user:pass@host:5432/db"
+                        onChange={(e) => update({ db_url: e.target.value })}
+                      />
+                      <button className="ghost" onClick={() => setShowDbUrl((s) => !s)} title={t("Show/hide the connection string")}>
+                        {showDbUrl ? t("Hide") : t("Show")}
+                      </button>
+                    </div>
                     <label title={t("The SELECT runs once before the load; its rows are used as data")}>
                       {t("SQL query")}
                     </label>

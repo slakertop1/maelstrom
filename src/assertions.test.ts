@@ -78,4 +78,30 @@ describe("evaluateAssertions", () => {
     const dis = { ...a({ type: "status", value: "404" }), enabled: false };
     expect(evaluateAssertions([dis], facts)).toHaveLength(0);
   });
+
+  describe("json_path eq/neq numeric and type-mismatch handling (e3)", () => {
+    const numFacts = { ...facts, body: '{"price":19.9,"obj":{"a":1},"arr":[1,2],"name":"Мир"}' };
+
+    it("compares numeric values numerically, not via string coercion", () => {
+      // 19.9 vs "19.90" would fail under String(actual) === value ("19.9" !== "19.90").
+      expect(evaluateAssertions([a({ type: "json_path", target: "price", op: "eq", value: "19.90" })], numFacts)[0].passed).toBe(true);
+      expect(evaluateAssertions([a({ type: "json_path", target: "price", op: "neq", value: "19.90" })], numFacts)[0].passed).toBe(false);
+      expect(evaluateAssertions([a({ type: "json_path", target: "price", op: "eq", value: "20" })], numFacts)[0].passed).toBe(false);
+      expect(evaluateAssertions([a({ type: "json_path", target: "price", op: "neq", value: "20" })], numFacts)[0].passed).toBe(true);
+    });
+
+    it("flags object/array actuals as an explicit type mismatch instead of stringifying", () => {
+      // String(actual) === value would previously compare "[object Object]" / "1,2".
+      expect(evaluateAssertions([a({ type: "json_path", target: "obj", op: "eq", value: "[object Object]" })], numFacts)[0].passed).toBe(false);
+      expect(evaluateAssertions([a({ type: "json_path", target: "obj", op: "neq", value: "[object Object]" })], numFacts)[0].passed).toBe(true);
+      expect(evaluateAssertions([a({ type: "json_path", target: "arr", op: "eq", value: "1,2" })], numFacts)[0].passed).toBe(false);
+      expect(evaluateAssertions([a({ type: "json_path", target: "arr", op: "neq", value: "1,2" })], numFacts)[0].passed).toBe(true);
+    });
+
+    it("keeps ordinary string equality behavior", () => {
+      expect(evaluateAssertions([a({ type: "json_path", target: "name", op: "eq", value: "Мир" })], numFacts)[0].passed).toBe(true);
+      expect(evaluateAssertions([a({ type: "json_path", target: "name", op: "neq", value: "Мир" })], numFacts)[0].passed).toBe(false);
+      expect(evaluateAssertions([a({ type: "json_path", target: "name", op: "eq", value: "Nope" })], numFacts)[0].passed).toBe(false);
+    });
+  });
 });

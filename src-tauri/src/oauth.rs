@@ -146,7 +146,7 @@ async fn wait_for_code(
                 .await;
             continue;
         }
-        let query = path.splitn(2, '?').nth(1).unwrap_or("");
+        let query = path.split_once('?').map_or("", |x| x.1);
         let result = parse_callback_query(query, expected_state);
 
         let body = if result.is_ok() {

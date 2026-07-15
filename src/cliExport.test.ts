@@ -38,7 +38,11 @@ describe("CLI scenario builders", () => {
     expect(cfg.targets[0].method).toBe("GET");
     expect(cfg.targets[0].rps).toBe(250);
     expect(cfg.targets[0].url).toContain("${TOKEN}"); // left for the CLI to expand
-    expect(cfg.thresholds).toEqual({ max_error_rate: 1.0, max_p95_ms: 500 });
+    // max_error_rate is a real, non-disabling gate (percent scale) — not the
+    // old 1.0-that-reads-like-"100%-allowed" default.
+    expect(cfg.thresholds.max_error_rate).toBeGreaterThan(0);
+    expect(cfg.thresholds.max_error_rate).toBeLessThan(100);
+    expect(cfg.thresholds.max_p95_ms).toBe(500);
     expect(cfg.grpc).toBeUndefined();
     expect(cfg.websocket).toBeUndefined();
   });
@@ -46,6 +50,23 @@ describe("CLI scenario builders", () => {
   it("HTTP: an unset RPS limit falls back to a positive default (CLI needs rps > 0)", () => {
     const cfg: any = buildHttpScenario("svc", lt(""), emptyHttp);
     expect(cfg.targets[0].rps).toBe(HTTP_TARGET_DEFAULT_RPS);
+  });
+
+  it("HTTP: an explicit 0/negative/NaN RPS limit also falls back to the default (f5)", () => {
+    expect(buildHttpScenario("svc", lt(0 as any), emptyHttp).targets[0].rps).toBe(
+      HTTP_TARGET_DEFAULT_RPS
+    );
+    expect(buildHttpScenario("svc", lt(-5 as any), emptyHttp).targets[0].rps).toBe(
+      HTTP_TARGET_DEFAULT_RPS
+    );
+    expect(buildHttpScenario("svc", lt(NaN as any), emptyHttp).targets[0].rps).toBe(
+      HTTP_TARGET_DEFAULT_RPS
+    );
+  });
+
+  it("HTTP: a valid positive RPS limit is carried through unchanged", () => {
+    const cfg: any = buildHttpScenario("svc", lt(42), emptyHttp);
+    expect(cfg.targets[0].rps).toBe(42);
   });
 
   it("gRPC: a grpc block, VU-driven, rps_limit null when unset and carried when set", () => {

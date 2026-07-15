@@ -6,7 +6,67 @@ function esc(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// ---- secret query-param masking (exported HTML reports are shareable files —
+// query strings like ?token=... / ?api_key=... must never leak into them) ----
+
+// e2: matched as a SUBSTRING of the normalized (lowercase, -/_ stripped) key,
+// not an exact match — otherwise composite names like access_token,
+// refresh_token, client_secret or id_token slip through unmasked. Mirrors the
+// Rust side (core/src/redact.rs, is_secret_query_key), which also uses
+// contains().
+const SECRET_QUERY_KEY_SUBSTRINGS = [
+  "token",
+  "key",
+  "secret",
+  "password",
+  "apikey",
+  "sig",
+  "signature",
+  "accesskey",
+];
+
+function isSecretQueryKey(name: string): boolean {
+  const normalized = name.toLowerCase().replace(/[-_]/g, "");
+  if (normalized.startsWith("xamz")) return true; // x-amz-*, x-amz-signature, etc.
+  return SECRET_QUERY_KEY_SUBSTRINGS.some((s) => normalized.includes(s));
+}
+
+/// Mutates `params` in place, replacing any secret-looking values with `***`.
+/// Returns true if anything was masked.
+function maskSecretQueryParams(params: URLSearchParams): boolean {
+  let masked = false;
+  for (const name of [...params.keys()]) {
+    if (isSecretQueryKey(name)) {
+      params.set(name, "***");
+      masked = true;
+    }
+  }
+  return masked;
+}
+
+/// Mask secret-looking query params (token/key/secret/password/apikey/sig/
+/// signature/x-amz-*, case-insensitive, -/_ normalized) before a URL is
+/// embedded in an exported (shareable) HTML report.
+function maskUrl(rawUrl: string): string {
+  let u: URL;
+  let hasOrigin = true;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    try {
+      u = new URL(rawUrl, "http://placeholder.invalid");
+      hasOrigin = false;
+    } catch {
+      return rawUrl;
+    }
+  }
+  if (!maskSecretQueryParams(u.searchParams)) return rawUrl;
+  return hasOrigin ? u.toString() : u.pathname + u.search + u.hash;
 }
 
 const REPORT_CSS = `
@@ -52,6 +112,7 @@ const REPORT_CSS = `
 `;
 
 export function buildReportHtml(r: LoadTestResult): string {
+  const maskedUrl = maskUrl(r.url);
   const ok = r.error_rate < 1;
   const warn = r.error_rate >= 1 && r.error_rate < 5;
   const verdict = ok
@@ -142,14 +203,14 @@ export function buildReportHtml(r: LoadTestResult): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${tr("Load test report")} — ${esc(r.url)}</title>
+<title>${tr("Load test report")} — ${esc(maskedUrl)}</title>
 <style>${REPORT_CSS}</style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1><span class="accent">⚡ Maelstrom</span> — ${tr("load test report")}</h1>
-    <div class="target"><span class="method">${esc(r.method)}</span><span class="url">${esc(r.url)}</span></div>
+    <div class="target"><span class="method">${esc(r.method)}</span><span class="url">${esc(maskedUrl)}</span></div>
     <div class="chips">
       <span class="chip">${tr("Started")}: <b>${esc(r.started_at)}</b></span>
       <span class="chip">${tr("Duration")}: <b>${(r.actual_duration_ms / 1000).toFixed(1)} ${tr("s")}</b>${r.stopped_early ? " " + tr("(stopped manually)") : ""}</span>
@@ -351,8 +412,9 @@ export function buildScenarioReportHtml(s: ScenarioResult): string {
 function shortUrl(url: string): string {
   try {
     const u = new URL(url);
+    maskSecretQueryParams(u.searchParams);
     return u.pathname + (u.search ? u.search : "");
   } catch {
-    return url;
+    return maskUrl(url);
   }
 }

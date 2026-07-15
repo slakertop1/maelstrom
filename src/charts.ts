@@ -24,6 +24,10 @@ function esc(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function isFinitePoint(p: { x: number; y: number }): boolean {
+  return Number.isFinite(p.x) && Number.isFinite(p.y);
+}
+
 export function fmtNum(v: number): string {
   if (!isFinite(v)) return "0";
   if (Math.abs(v) >= 1_000_000) return (v / 1_000_000).toFixed(1) + "M";
@@ -75,7 +79,11 @@ export function lineChart(opts: LineChartOpts): string {
   const yFmt = opts.yFormat ?? fmtNum;
   const xFmt = opts.xFormat ?? fmtNum;
 
-  const allPoints = opts.series.flatMap((s) => s.points);
+  // Drop non-finite (NaN/Infinity) points up front — a single bad reading
+  // must not poison the axis domain or corrupt the whole points="" attribute
+  // of a polyline/polygon (SVG rejects the entire attribute if any pair in it
+  // is invalid).
+  const allPoints = opts.series.flatMap((s) => s.points).filter(isFinitePoint);
   // Fold instead of spreading into Math.min/max — a long run can have thousands
   // of points, and `Math.max(...bigArray)` overflows the argument/stack limit.
   const xMin = allPoints.length ? allPoints.reduce((m, p) => Math.min(m, p.x), Infinity) : 0;
@@ -107,19 +115,21 @@ export function lineChart(opts: LineChartOpts): string {
 
   // series
   for (const s of opts.series) {
-    if (!s.points.length) continue;
-    const pts = s.points
-      .slice()
-      .sort((a, b) => a.x - b.x)
-      .map((p) => `${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`);
+    // Non-finite points (NaN/Infinity from a bad sample) would otherwise
+    // produce an invalid coordinate pair and break the entire points=""
+    // attribute — drop them rather than let one point kill the whole line.
+    const finitePoints = s.points.filter(isFinitePoint);
+    if (!finitePoints.length) continue;
+    const sorted = finitePoints.slice().sort((a, b) => a.x - b.x);
+    const pts = sorted.map((p) => `${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`);
     if (s.fill) {
       const gid = `grad${gradientCounter++}`;
       out += `<defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">`;
       out += `<stop offset="0%" stop-color="${s.color}" stop-opacity="0.35"/>`;
       out += `<stop offset="100%" stop-color="${s.color}" stop-opacity="0.02"/>`;
       out += `</linearGradient></defs>`;
-      const first = s.points.reduce((a, b) => (a.x < b.x ? a : b));
-      const last = s.points.reduce((a, b) => (a.x > b.x ? a : b));
+      const first = sorted.reduce((a, b) => (a.x < b.x ? a : b));
+      const last = sorted.reduce((a, b) => (a.x > b.x ? a : b));
       out += `<polygon points="${sx(first.x).toFixed(1)},${(padT + ih).toFixed(1)} ${pts.join(" ")} ${sx(last.x).toFixed(1)},${(padT + ih).toFixed(1)}" fill="url(#${gid})"/>`;
     }
     out += `<polyline points="${pts.join(" ")}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;

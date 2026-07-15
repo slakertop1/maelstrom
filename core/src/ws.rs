@@ -79,24 +79,35 @@ type Ws = tokio_tungstenite::WebSocketStream<
 
 /// One send→reply round-trip on an existing connection. Returns latency (µs) and
 /// whether it succeeded (a reply arrived in time).
-async fn round_trip(ws: &mut Ws, message: &str, timeout: Duration) -> (u64, bool) {
+async fn round_trip(ws: &mut Ws, message: &str, timeout: Duration, cancel: &CancellationToken) -> (u64, bool) {
     let start = Instant::now();
     if ws.send(Message::Text(message.into())).await.is_err() {
         return (start.elapsed().as_micros().max(1) as u64, false);
     }
-    // Await the first non-control reply (or timeout).
+    // One deadline for the WHOLE round-trip, set once — NOT re-armed on every
+    // control frame. `tokio::time::timeout` per-iteration used to reset the
+    // clock on each ping/pong, so a chatty peer that never sends a real reply
+    // could stall this indefinitely. Cancellation is checked inside the wait
+    // too (not just between round-trips in the caller), so Stop takes effect
+    // immediately instead of only after the current wait gives up on its own.
+    let deadline = tokio::time::Instant::now() + timeout;
     let ok = loop {
-        match tokio::time::timeout(timeout, ws.next()).await {
-            Ok(Some(Ok(m))) => {
-                if matches!(m, Message::Close(_)) {
-                    break false;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break false,
+            _ = tokio::time::sleep_until(deadline) => break false,
+            msg = ws.next() => match msg {
+                Some(Ok(m)) => {
+                    if matches!(m, Message::Close(_)) {
+                        break false;
+                    }
+                    if render(&m).is_some() {
+                        break true;
+                    }
+                    // control frame (ping/pong) — keep waiting, deadline unchanged
                 }
-                if render(&m).is_some() {
-                    break true;
-                }
-                // control frame (ping/pong) — keep waiting
-            }
-            _ => break false,
+                _ => break false,
+            },
         }
     };
     ((start.elapsed().as_micros().max(1)) as u64, ok)
@@ -136,7 +147,12 @@ pub async fn ws_load(
 
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(duration_secs);
-    let (tx, rx) = mpsc::unbounded_channel::<(u64, bool)>();
+    // Bounded, unlike an unbounded channel — the aggregator is a tight
+    // in-memory loop so this should rarely fill, but a bound means a stalled
+    // aggregator applies backpressure to VUs instead of letting latency
+    // samples pile up in memory without limit.
+    const RESULT_CHANNEL_CAP: usize = 4096;
+    let (tx, rx) = mpsc::channel::<(u64, bool)>(RESULT_CHANNEL_CAP);
     let url = Arc::new(url.to_string());
     let message = Arc::new(message.to_string());
 
@@ -165,18 +181,24 @@ pub async fn ws_load(
                     match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(&*url)).await {
                         Ok(Ok((ws, _))) => conn = Some(ws),
                         _ => {
-                            let _ = tx.send((timeout.as_micros() as u64, false));
+                            let _ = tx.send((timeout.as_micros() as u64, false)).await;
                             tokio::time::sleep(Duration::from_millis(25)).await;
                             continue;
                         }
                     }
                 }
                 let ws = conn.as_mut().unwrap();
-                let (latency_us, ok) = round_trip(ws, &message, timeout).await;
+                let (latency_us, ok) = round_trip(ws, &message, timeout, &cancel).await;
                 if !ok {
-                    conn = None; // drop broken connection; reconnect next iteration
+                    // Best-effort Close before dropping — the peer previously
+                    // just saw a bare TCP drop on every failed round-trip.
+                    // Bounded by its own short timeout so a stuck/dead peer
+                    // can't stall the reconnect loop waiting for it.
+                    if let Some(mut dead) = conn.take() {
+                        let _ = tokio::time::timeout(Duration::from_millis(200), dead.close(None)).await;
+                    }
                 }
-                if tx.send((latency_us, ok)).is_err() {
+                if tx.send((latency_us, ok)).await.is_err() {
                     break;
                 }
                 if !ok {
@@ -231,7 +253,7 @@ fn spawn_rps_refill(sem: Arc<Semaphore>, rps: u32, cancel: CancellationToken, du
 }
 
 async fn aggregate(
-    mut rx: mpsc::UnboundedReceiver<(u64, bool)>,
+    mut rx: mpsc::Receiver<(u64, bool)>,
     meta: RunMeta,
     started: Instant,
 ) -> LoadTestResult {

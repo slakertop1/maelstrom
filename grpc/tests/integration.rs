@@ -182,4 +182,21 @@ async fn grpc_load_runs_and_aggregates() {
     assert!(result.total_requests > 0, "no requests ran");
     assert_eq!(result.errors, 0, "unexpected errors");
     assert!(result.p95_ms >= 0.0);
+
+    // Regression: a successful grpc_load run must show up in the status
+    // breakdown as success (HTTP-convention "200"), never as "Сетевая
+    // ошибка" — that label is status_label(0, is_db=false), the sentinel
+    // for a network/connect failure, not for tonic::Code::Ok.
+    assert!(
+        !result.status_counts.iter().any(|(label, _)| label == "Сетевая ошибка"),
+        "successful gRPC calls mislabeled as network error: {:?}",
+        result.status_counts
+    );
+    let success_count: u64 = result
+        .status_counts
+        .iter()
+        .filter(|(label, _)| label == "200")
+        .map(|(_, c)| *c)
+        .sum();
+    assert_eq!(success_count, result.total_requests, "status breakdown: {:?}", result.status_counts);
 }

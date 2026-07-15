@@ -246,11 +246,12 @@ async fn dispatcher(
     dyn_state: Arc<DynState>,
     dropped: Arc<AtomicU64>,
 ) {
-    let per_tick = target.rps as f64 / 20.0;
-    let cap = ((target.rps as usize) * 2).clamp(50, 20_000);
+    let rps = target.rps;
+    let cap = ((rps as usize) * 2).clamp(50, 20_000);
     let inflight = Arc::new(AtomicUsize::new(0));
     let target = Arc::new(target);
-    let mut acc = 0.0_f64;
+    let started = tokio::time::Instant::now();
+    let mut generated: u64 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -261,15 +262,23 @@ async fn dispatcher(
             _ = tokio::time::sleep_until(deadline) => break,
             _ = interval.tick() => {}
         }
-        acc += per_tick;
-        let mut n = acc.floor() as usize;
-        acc -= n as f64;
+        // Target arrivals come from wall-clock elapsed time, not from counting
+        // realized `interval.tick()` events: under load, MissedTickBehavior::
+        // Skip silently drops missed ticks, and a per-tick fixed increment
+        // would lose that time's worth of requests with no trace anywhere —
+        // the reported RPS would quietly undershoot the target. Basing it on
+        // elapsed time means a late/skipped tick still catches up to the
+        // correct cumulative total; any of that catch-up the inflight cap
+        // can't absorb is counted as dropped below, same as before.
+        let target_total = (started.elapsed().as_secs_f64() * rps as f64).floor() as u64;
+        let mut n = target_total.saturating_sub(generated);
+        generated = target_total;
         while n > 0 {
             if inflight.load(Ordering::Relaxed) >= cap {
                 // Target can't keep up: the remaining arrivals for this tick are
                 // dropped (open model). Count them instead of silently discarding
                 // so the reported RPS shortfall is attributable.
-                dropped.fetch_add(n as u64, Ordering::Relaxed);
+                dropped.fetch_add(n, Ordering::Relaxed);
                 break;
             }
             inflight.fetch_add(1, Ordering::Relaxed);

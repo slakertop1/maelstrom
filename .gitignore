@@ -25,5 +25,6 @@ portable/
 # Внутренние доки и рабочие эпики — НЕ публиковать
 CONTEXT.md
 REVIEW_NOTES.md
+REVIEW_RUN.md
 maelstrom-epic*.txt
 maelstrom-rollout-epic*.txt

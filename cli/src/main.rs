@@ -144,14 +144,24 @@ fn default_timeout() -> u64 {
 
 /// A threshold is breached when the measured value strictly exceeds the limit.
 /// `None` means the threshold isn't set, so it can never fail the run.
+/// A NaN value (e.g. 0/0 success-rate when zero iterations completed) can't be
+/// meaningfully compared with `<`/`>` — both would silently return `false` and
+/// let the gate pass. Treat NaN as a breach whenever a limit is actually set.
 fn breached(value: f64, max: Option<f64>) -> bool {
-    matches!(max, Some(m) if value > m)
+    match max {
+        Some(m) => value.is_nan() || value > m,
+        None => false,
+    }
 }
 
 /// Floor threshold (e.g. chain success-rate): breached when the value falls
-/// strictly BELOW the limit. `None` — not set, never fails.
+/// strictly BELOW the limit. `None` — not set, never fails. Same NaN handling
+/// as `breached`: NaN counts as a breach, not a silent pass.
 fn below(value: f64, min: Option<f64>) -> bool {
-    matches!(min, Some(m) if value < m)
+    match min {
+        Some(m) => value.is_nan() || value < m,
+        None => false,
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -246,6 +256,16 @@ async fn main() -> ExitCode {
     };
 
     let duration = args.duration.unwrap_or(cfg.duration_secs);
+
+    // A config with none of targets/streams/grpc/websocket has nothing to run —
+    // without this check it would silently exit 0 having done no work at all.
+    if cfg.targets.is_empty() && cfg.streams.is_empty() && cfg.grpc.is_none() && cfg.websocket.is_none() {
+        log!(
+            "CLI",
+            "Пустой конфиг: нет ни targets, ни streams, ни grpc, ни websocket — нечего запускать"
+        );
+        return ExitCode::from(2);
+    }
 
     // gRPC / WebSocket / streams load paths run and return before the HTTP
     // scenario.
@@ -362,12 +382,17 @@ async fn main() -> ExitCode {
     };
 
     // write reports
-    if let Ok(json) = serde_json::to_string_pretty(&result) {
-        if let Err(e) = std::fs::write(&args.out_json, json) {
-            log!("CLI", "Не удалось записать {}: {e}", args.out_json);
-        } else {
-            log!("CLI", "JSON-отчёт записан: {}", args.out_json);
-            println!("JSON-отчёт: {}", args.out_json);
+    match serde_json::to_string_pretty(&result) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&args.out_json, json) {
+                log!("CLI", "Не удалось записать {}: {e}", args.out_json);
+            } else {
+                log!("CLI", "JSON-отчёт записан: {}", args.out_json);
+                println!("JSON-отчёт: {}", args.out_json);
+            }
+        }
+        Err(e) => {
+            log!("CLI", "Не удалось сериализовать JSON-отчёт: {e}");
         }
     }
     if let Some(html_path) = &args.out_html {
@@ -430,6 +455,17 @@ async fn main() -> ExitCode {
     // thresholds → exit code
     let max_err = args.max_error_rate.or(cfg.thresholds.as_ref().and_then(|t| t.max_error_rate));
     let max_p95 = args.max_p95.or(cfg.thresholds.as_ref().and_then(|t| t.max_p95_ms));
+    if args.min_success_rate.is_some()
+        || cfg.thresholds.as_ref().and_then(|t| t.min_success_rate).is_some()
+    {
+        log!(
+            "CLI",
+            "⚠ --min-success-rate/min_success_rate применяется только к потокам (streams) — для HTTP-конфига порог игнорируется"
+        );
+        eprintln!(
+            "⚠ --min-success-rate/min_success_rate применяется только к потокам (streams) — для HTTP-конфига порог игнорируется"
+        );
+    }
     let mut failed = false;
     if let Some(me) = max_err {
         if breached(o.error_rate, Some(me)) {
@@ -568,12 +604,17 @@ async fn run_streams_load(
     };
 
     // JSON report.
-    if let Ok(json) = serde_json::to_string_pretty(&result) {
-        if let Err(e) = std::fs::write(&args.out_json, json) {
-            log("CLI", format!("Не удалось записать {}: {e}", args.out_json));
-        } else {
-            log("CLI", format!("JSON-отчёт записан: {}", args.out_json));
-            println!("JSON-отчёт: {}", args.out_json);
+    match serde_json::to_string_pretty(&result) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&args.out_json, json) {
+                log("CLI", format!("Не удалось записать {}: {e}", args.out_json));
+            } else {
+                log("CLI", format!("JSON-отчёт записан: {}", args.out_json));
+                println!("JSON-отчёт: {}", args.out_json);
+            }
+        }
+        Err(e) => {
+            log("CLI", format!("Не удалось сериализовать JSON-отчёт: {e}"));
         }
     }
     if args.out_html.is_some() {
@@ -767,11 +808,22 @@ fn finish_load(
     log_file: &Option<String>,
 ) -> ExitCode {
     let log = |cat: &str, msg: String| log_line(log_file, cat, &msg);
-    if let Ok(json) = serde_json::to_string_pretty(&result) {
-        if std::fs::write(&args.out_json, json).is_ok() {
-            log("CLI", format!("JSON-отчёт: {}", args.out_json));
-            println!("JSON-отчёт: {}", args.out_json);
+    match serde_json::to_string_pretty(&result) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&args.out_json, json) {
+                log("CLI", format!("Не удалось записать {}: {e}", args.out_json));
+            } else {
+                log("CLI", format!("JSON-отчёт: {}", args.out_json));
+                println!("JSON-отчёт: {}", args.out_json);
+            }
         }
+        Err(e) => {
+            log("CLI", format!("Не удалось сериализовать JSON-отчёт: {e}"));
+        }
+    }
+    if args.out_html.is_some() {
+        log("CLI", format!("HTML-отчёт для {kind} пока не поддерживается — записан JSON"));
+        eprintln!("⚠ HTML-отчёт для {kind} пока не поддерживается — записан JSON");
     }
     log(
         "ИТОГ",
@@ -787,6 +839,17 @@ fn finish_load(
 
     let max_err = args.max_error_rate.or(thresholds.and_then(|t| t.max_error_rate));
     let max_p95 = args.max_p95.or(thresholds.and_then(|t| t.max_p95_ms));
+    if args.min_success_rate.is_some() || thresholds.and_then(|t| t.min_success_rate).is_some() {
+        log(
+            "CLI",
+            format!(
+                "⚠ --min-success-rate/min_success_rate применяется только к потокам (streams) — для {kind}-конфига порог игнорируется"
+            ),
+        );
+        eprintln!(
+            "⚠ --min-success-rate/min_success_rate применяется только к потокам (streams) — для {kind}-конфига порог игнорируется"
+        );
+    }
     let mut failed = false;
     if let Some(me) = max_err {
         if breached(result.error_rate, Some(me)) {
