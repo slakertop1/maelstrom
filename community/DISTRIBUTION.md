@@ -25,9 +25,10 @@
 ## Выпуск новой версии
 
 ```bash
-# поднять версию в src-tauri/tauri.conf.json и src-tauri/Cargo.toml, обновить CHANGELOG.md
-git tag v0.1.0
-git push origin v0.1.0
+# поднять версию в core/db/grpc/cli/src-tauri Cargo.toml, src-tauri/tauri.conf.json,
+# package.json, обновить CHANGELOG.md
+git tag v0.4.1
+git push origin v0.4.1
 ```
 CI соберёт Windows (MSI + портативка) и macOS (dmg) и выложит их в Releases публичного
 репозитория. Пользователи скачивают оттуда.

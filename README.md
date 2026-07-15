@@ -54,6 +54,13 @@ Two audiences, one engine:
 - **Service load (multi-endpoint)** — pick several endpoints of a collection,
   set a **per-endpoint RPS**, run them concurrently (open-model dispatcher), get
   per-endpoint and aggregate stats + a report.
+- **Request chaining (streams)** — a run of parallel independent chains; each
+  chain is ordered steps with its own RPS (chain iterations/sec, open model).
+  Extract a value from a step's response (JSON path / header / regex) into a
+  `{{name}}` var and reuse it in later steps of the same iteration. Reported
+  three levels deep (overall → per chain → per step); a stream's RPS is the load
+  on its **target (last) endpoint**. The CLI gates per-stream chain completion
+  via `--min-success-rate`.
 - **Reports**: a self-contained HTML file (inline SVG charts — verdict, metric
   cards, throughput & latency, response-time distribution, status codes,
   per-second timeline) + raw JSON export.
@@ -61,7 +68,8 @@ Two audiences, one engine:
 **Protocols**
 - **gRPC** from a `.proto` with **no protoc** (dynamic via prost-reflect/protox):
   list methods, prefill the request from the message schema, unary + server /
-  client / bidi streaming, and gRPC load. Missing imports are auto-resolved by
+  client / bidi streaming, and gRPC load. **TLS** with a custom CA and a client
+  certificate (mTLS) is supported. Missing imports are auto-resolved by
   searching the tree; manual "import folders" also supported.
 - **WebSocket**: connect, send, receive, and load (each virtual user holds the
   connection and measures message → response time).
@@ -167,15 +175,17 @@ Config shape:
   ],
   "datasets": [ /* CSV/JSON/S3/DB */ ],
   "file_pools": [ /* uploads */ ],
-  "grpc":      { /* or a gRPC load block: endpoint, proto_path, service, method, body, vus, rps_limit */ },
+  "grpc":      { /* or a gRPC load block: endpoint, proto_path, service, method, body, vus, rps_limit, tls */ },
   "websocket": { /* or a WebSocket load block: url, message, vus, rps_limit */ },
-  "thresholds": { "max_error_rate": 1.0, "max_p95_ms": 400 }
+  "streams":   [ /* or request chains: { name, rps, steps:[{ name, method, url, body, extract:[{ name, from, expr }] }] } */ ],
+  "thresholds": { "max_error_rate": 1.0, "max_p95_ms": 400, "min_success_rate": 99.0 }
 }
 ```
 `${VAR}` anywhere is expanded from the environment at run time (JSON-escaped).
 
 Flags: `--out-json`, `--out-html`, `--duration N`, `--max-error-rate P`,
-`--max-p95 MS`, `--quiet`, `--log-file PATH` (secrets redacted).
+`--max-p95 MS`, `--min-success-rate P` (per-stream chain completion),
+`--quiet`, `--log-file PATH` (secrets redacted).
 Exit codes: **0** thresholds passed · **1** breached · **2** config/startup error.
 
 Distribution: standalone binaries (Windows/macOS/Linux) on the release, and a
@@ -234,10 +244,10 @@ The version-by-version update history is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ### Roadmap
 
-Done: HTTP client, OAuth2/SSO + auto-refresh, mTLS, single & multi-endpoint load,
-**gRPC**, **WebSocket**, DB as source + load, response assertions, datasets &
-generators, OpenAPI/Swagger import, HTML reports, i18n (EN/RU), CLI + Docker
-distribution, Export for CI.
+Done: HTTP client, OAuth2/SSO + auto-refresh, mTLS (HTTP & gRPC), single &
+multi-endpoint load, **request chaining (streams)**, **gRPC**, **WebSocket**,
+DB as source + load, response assertions, datasets & generators, OpenAPI/Swagger
+import, HTML reports, i18n (EN/RU), CLI + Docker distribution, Export for CI.
 
 Planned:
 - **Kafka** — produce/consume + topic load (rdkafka).

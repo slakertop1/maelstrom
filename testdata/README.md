@@ -4,7 +4,7 @@
 
 ## 0. Запуск
 
-1. Установите приложение: `D:\api_forge\target\release\bundle\msi\Maelstrom_0.1.0_x64_en-US.msi`.
+1. Установите приложение: `target\release\bundle\msi\Maelstrom_0.4.1_x64_en-US.msi`.
 2. Запустите mock-сервер (в этой папке):
 
    ```
