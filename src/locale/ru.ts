@@ -102,6 +102,10 @@ export const ru: Record<string, string> = {
   "{done}/{started} chains completed ({rate}%)":
     "цепочек завершено {done}/{started} ({rate}%)",
   "{n} not sent": "не отправлено: {n}",
+  "{rps} rps on the target endpoint": "{rps} rps на целевой endpoint",
+  "RPS (all steps)": "RPS (все шаги)",
+  "RPS (all steps, avg)": "RPS (все шаги, средн.)",
+  target: "цель",
   "(deleted)": "(удалён)",
   "run the chained load test": "запустить нагрузку цепочками",
   "No runnable streams (every step's request is missing).":

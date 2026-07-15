@@ -382,7 +382,7 @@ function OverallCards({
     running && progress
       ? [
           { label: t("Total requests"), value: fmtNum(progress.overall_total) },
-          { label: t("RPS (total)"), value: fmtNum(progress.overall_rps) },
+          { label: t("RPS (all steps)"), value: fmtNum(progress.overall_rps) },
           { label: t("p95 (overall)"), value: fmtMs(progress.overall_p95_ms) },
           {
             label: t("Errors"),
@@ -393,7 +393,7 @@ function OverallCards({
       : result
         ? [
             { label: t("Total requests"), value: fmtNum(result.overall.total_requests) },
-            { label: t("RPS (average)"), value: fmtNum(result.overall.rps_avg) },
+            { label: t("RPS (all steps, avg)"), value: fmtNum(result.overall.rps_avg) },
             { label: t("p95 (overall)"), value: fmtMs(result.overall.p95_ms) },
             {
               label: t("Errors"),
@@ -417,10 +417,13 @@ function OverallCards({
 function StreamResultView({ s }: { s: StreamResult }) {
   const t = useT();
   const ok = s.success_rate >= 99;
+  const last = s.steps.length - 1;
+  const targetRps = last >= 0 ? s.steps[last].rps_avg : 0;
   return (
     <div className="lt-chart">
       <h3>
         {t("Stream")} «{s.name}» ·{" "}
+        <b>{tr2("{rps} rps on the target endpoint", { rps: fmtNum(targetRps) })}</b> ·{" "}
         <span className={ok ? "sr-ok" : "sr-bad"}>
           {tr2("{done}/{started} chains completed ({rate}%)", {
             done: fmtNum(s.iterations_completed),
@@ -454,6 +457,9 @@ function StreamResultView({ s }: { s: StreamResult }) {
               </td>
               <td className="scenario-url" style={{ maxWidth: 360 }}>
                 {st.url}
+                {i === last ? (
+                  <span style={{ opacity: 0.7, fontSize: "0.85em" }}> · {t("target")}</span>
+                ) : null}
               </td>
               <td>{fmtNum(st.total_requests)}</td>
               <td>{fmtNum(st.rps_avg)}</td>

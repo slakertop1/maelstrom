@@ -607,7 +607,7 @@ async fn run_streams_load(
             &log_prog,
             "ПРОГРЕСС",
             &format!(
-                "{:.0}с rps={:.0} всего={} ошибок={} p95={:.0}мс | цепочки: {chains}",
+                "{:.0}с Σrps={:.0} всего={} ошибок={} p95={:.0}мс | целевой rps: {chains}",
                 p.elapsed_secs, p.overall_rps, p.overall_total, p.overall_errors, p.overall_p95_ms
             ),
         );
@@ -615,7 +615,7 @@ async fn run_streams_load(
             return;
         }
         println!(
-            "[{:>4.0}с] rps={:>7} всего={:>9} ошибок={:>6} p95={:.0}мс",
+            "[{:>4.0}с] Σrps={:>7} всего={:>9} ошибок={:>6} p95={:.0}мс | целевой rps: {chains}",
             p.elapsed_secs,
             fmt(p.overall_rps),
             fmt(p.overall_total as f64),
@@ -659,38 +659,46 @@ async fn run_streams_load(
     log(
         "ИТОГ",
         format!(
-            "{} запросов, {:.2}% ошибок, rps(средн.)={:.0}, p95={:.0}мс, p99={:.0}мс",
+            "{} запросов (сумма по всем шагам), {:.2}% ошибок, Σrps={:.0}, p95={:.0}мс, p99={:.0}мс",
             o.total_requests, o.error_rate, o.rps_avg, o.p95_ms, o.p99_ms
         ),
     );
     println!(
-        "\nИтог: {} запросов, {:.2}% ошибок, RPS(средний)={:.0}, p95={:.0}мс, p99={:.0}мс",
+        "\nИтог (сумма по всем шагам всех потоков): {} запросов, {:.2}% ошибок, суммарный RPS={:.0}, p95={:.0}мс, p99={:.0}мс",
         o.total_requests, o.error_rate, o.rps_avg, o.p95_ms, o.p99_ms
     );
-    println!("Потоки:");
+    println!("Потоки (RPS — на целевой endpoint каждой цепочки):");
     for s in &result.streams {
+        // The chain's "target" endpoint is its last step; its rps is the load
+        // that actually reaches the endpoint you usually care about — unlike the
+        // Σrps above, which sums every step of every stream.
+        let target_rps = s.steps.last().map(|st| st.rps_avg).unwrap_or(0.0);
         let head = format!(
-            "«{}»: итераций={} завершено={} ({:.1}%), e2e p95={:.0}мс{}",
+            "«{}»: {:.0} rps на целевой endpoint · цепочек {}/{} завершено ({:.1}%) · e2e p95={:.0}мс{}",
             s.name,
-            s.iterations_started,
+            target_rps,
             s.iterations_completed,
+            s.iterations_started,
             s.success_rate,
             s.e2e_p95_ms,
-            if s.dropped > 0 { format!(", недодано={}", s.dropped) } else { String::new() }
+            if s.dropped > 0 { format!(" · недодано={}", s.dropped) } else { String::new() }
         );
         log("ИТОГ", format!("  {head}"));
         println!("  {head}");
+        let last = s.steps.len().saturating_sub(1);
         for (j, st) in s.steps.iter().enumerate() {
             let safe = maelstrom_core::redact::safe_url(&st.url);
+            let marker = if j == last { "  ← целевой endpoint" } else { "" };
             let line = format!(
-                "{}. {:<7} {:<40} запросов={:<9} rps={:<7.0} ошибок={:.2}%  p95={:.0}мс",
+                "{}. {:<7} {:<40} запросов={:<9} rps={:<7.0} ошибок={:.2}%  p95={:.0}мс{}",
                 j + 1,
                 st.method,
                 truncate(&safe, 40),
                 st.total_requests,
                 st.rps_avg,
                 st.error_rate,
-                st.p95_ms
+                st.p95_ms,
+                marker
             );
             log("ИТОГ", format!("    {line}"));
             println!("    {line}");
