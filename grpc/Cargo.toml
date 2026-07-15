@@ -1,6 +1,6 @@
 [package]
 name = "maelstrom-grpc"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Dynamic gRPC client for Maelstrom: load .proto at runtime, unary/streaming calls, load testing"
 
